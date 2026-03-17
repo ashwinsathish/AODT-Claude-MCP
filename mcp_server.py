@@ -92,13 +92,14 @@ def traverse(prim, current_depth, max_depth):
         return []
     
     # Format current prim
-    line = "{'  ' * current_depth}" + str(prim.GetPath()) + " [" + prim.GetTypeName() + "]"
+    indent = "  " * current_depth
+    line = indent + str(prim.GetPath()) + " [" + prim.GetTypeName() + "]"
     lines = [line]
     
     children = prim.GetChildren()
     if children:
         if current_depth == max_depth:
-            lines.append("{'  ' * (current_depth + 1)}... (children truncated, increase max_depth to see more)")
+            lines.append("  " * (current_depth + 1) + "... (children truncated, increase max_depth to see more)")
         else:
             for child in children:
                 lines.extend(traverse(child, current_depth + 1, max_depth))
