@@ -1,47 +1,41 @@
-# Nvidia Aerial Omniverse Digital Twin (AODT) MCP Server
+# NVIDIA Aerial Omniverse Digital Twin (AODT) MCP Server
 
-An open-source Model Context Protocol (MCP) framework for [Nvidia AODT](https://developer.nvidia.com/aerial-omniverse-digital-twin) that allows AI assistants like Claude to execute natural language instructions as Python code directly inside the AODT environment.
-
-This project is heavily inspired by [blender-mcp](https://github.com/ahujasid/blender-mcp), bringing the same "vibe coding" capabilities to Nvidia's Digital Twin ecosystem.
+A Model Context Protocol (MCP) server integration for [NVIDIA AODT](https://developer.nvidia.com/aerial-omniverse-digital-twin). This framework enables AI assistants to interface directly with a running AODT session to inspect the stage hierarchy, search for assets, and execute Python-based commands.
 
 ## Features
-- Control AODT directly from Claude using natural language.
-- **Stage Context**: Instantly list all USD objects (prims) and their hierarchy.
-- **Asset Search**: Automatically find .usd files (scenarios/scenes) in your local folders.
-- **Full Execution**: Run any `omni.kit` or USD Python command inside the active AODT session.
-- **Async Threading**: Code is executed safely on the Omniverse main thread without freezing the UI.
+
+- **Stage Inspection**: Retrieve a structured text-based tree of the current USD stage hierarchy.
+- **Asset Discovery**: Search for `.usd` assets across local directories and Omniverse Nucleus server paths.
+- **Command Execution**: Execute arbitrary `omni.kit` or USD Python commands within the active AODT application.
+- **Thread Safety**: Commands are dispatched to the Omniverse main application thread to ensure stage stability and UI responsiveness.
 
 ## Architecture
-The system consists of two parts:
-1. `aodt.mcp_server`: A custom Omniverse Extension running **inside** AODT that listens for incoming code execution requests on a background TCP socket (Port 9876).
-2. `mcp_server.py`: A standard FastMCP server that Claude connects to. It provides the AI with tools to send Python code to the AODT socket.
 
-## Installation & Usage
+The system consists of two primary components:
+1. **AODT Extension (`aodt.mcp_server`)**: A native Omniverse Kit extension that runs within AODT. It initializes a TCP socket server (default port 9876) to handle incoming requests.
+2. **MCP Server (`mcp_server.py`)**: A FastMCP-based server that acts as a bridge between the AI assistant and the AODT extension.
 
-### 1. Install the AODT Extension
-By default, AODT does not show the "Extensions" manager or "Script Editor" in its interface. We have enabled them by modifying the core AODT configuration file (`apps/aodt.kit`).
+## Installation
 
-1. **Restart AODT** on your machine if you had it open.
-2. In the top menu bar, you will now see **Window > Extensions** and **Window > Script Editor**.
-3. Go to **Window > Extensions**.
-4. In the Extension Manager that opens, click the **Gear Icon** (Settings) at the top right.
-5. Add a new **Extension Search Path** pointing to the `exts` folder in this repository. 
-   - Example: `/home/sal-garfield/aodt-mcp/exts`
-6. Close the settings panel. In the search bar at the top left of the Extension Manager, type `AODT MCP`.
-7. Enable the **AODT MCP Server Extension** using the toggle switch.
-8. You should see a message in the AODT Console (or terminal): `[AODT-MCP] Started socket server on 0.0.0.0:9876`.
+### 1. Enable the AODT Extension
 
-*Note: You can turn on the **Autoload** toggle next to the extension if you want it to run every time you open AODT.*
+AODT requires a configuration change to expose the Extension Manager.
 
-### 2. Configure Claude Desktop
-You need to tell Claude how to start the MCP server.
+1. Locate the AODT configuration file at `apps/aodt.kit` within your installation directory.
+2. Ensure the following extensions are enabled in the dependencies section:
+   ```toml
+   "omni.kit.window.extensions" = {}
+   "omni.kit.window.script_editor" = {}
+   ```
+3. Launch AODT.
+4. Open **Window > Extensions**.
+5. Click the **Gear Icon** (Settings) and add the `exts` folder of this repository to the **Extension Search Paths**.
+6. Search for `AODT MCP Server` and toggle it to **Enabled**.
 
-1. Install `uv` if you haven't already:
-   - Linux/Mac: `curl -LsSf https://astral.sh/uv/install.sh | sh`
-   - Windows: `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"`
-2. Open Claude Desktop settings:
-   - Go to **Claude > Settings > Developer > Edit Config** (`claude_desktop_config.json`).
-3. Add the AODT server to your configuration:
+### 2. Configure the MCP Client (e.g., Claude Desktop)
+
+Add the following to your `claude_desktop_config.json`:
+
 ```json
 {
   "mcpServers": {
@@ -56,22 +50,25 @@ You need to tell Claude how to start the MCP server.
   }
 }
 ```
-*(Replace `/absolute/path/to/aodt-mcp/` with the actual path where you cloned this repo).*
 
-4. Restart Claude Desktop.
+## Usage
 
-### 3. Usage Examples
-Once connected, you can ask Claude to do things in AODT!
+Once the MCP server is connected, the following tools become available:
 
-**Vibe Coding Prompts:**
-- *"Search for a Berlin scene in my assets."*
-- *"List the current stage hierarchy to see what's loaded."*
-- *"Create a red cube at the origin."*
-- *"Move all antennas in the scene up by 5 meters."*
+- `get_aodt_stage_hierarchy(max_depth)`: Scans the current USD stage and returns the prim tree.
+- `search_aodt_assets(query)`: Searches Nucleus (`omniverse://`) and local paths for matching assets.
+- `execute_aodt_command(code)`: Runs a Python string directly in the AODT environment.
+
+### Tool Examples:
+- "List the current stage hierarchy to depth 4."
+- "Search for 'tokyo' scenes in the Nucleus server."
+- "Create a red cube at world coordinates (0, 0, 0)."
 
 ## Troubleshooting
-- **Connection Refused**: Ensure the **AODT MCP Server Extension** is enabled in the Extension Manager. Check the console for `[AODT-MCP] Started socket server`.
-- **Port in Use**: If port 9876 is taken (e.g., by Blender MCP), close the other application or change the `PORT` variable in `exts/aodt.mcp_server/aodt/mcp_server/__init__.py` and `mcp_server.py`.
+
+- **Connection Refused**: Verify that the **AODT MCP Server Extension** is enabled in AODT and that the console logs indicate the socket server has started.
+- **Port Conflict**: If port 9876 is unavailable, update the `PORT` constant in both `mcp_server.py` and `exts/aodt.mcp_server/aodt/mcp_server/__init__.py`.
 
 ## License
-MIT License. Feel free to contribute, open issues, or submit PRs!
+
+MIT License
