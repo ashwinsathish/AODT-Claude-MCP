@@ -6,8 +6,10 @@ This project is heavily inspired by [blender-mcp](https://github.com/ahujasid/bl
 
 ## Features
 - Control AODT directly from Claude using natural language.
-- Run any `omni.kit` or USD Python command inside the active AODT session.
-- No UI freezing: Code is executed async on the Omniverse main thread.
+- **Stage Context**: Instantly list all USD objects (prims) and their hierarchy.
+- **Asset Search**: Automatically find .usd files (scenarios/scenes) in your local folders.
+- **Full Execution**: Run any `omni.kit` or USD Python command inside the active AODT session.
+- **Async Threading**: Code is executed safely on the Omniverse main thread without freezing the UI.
 
 ## Architecture
 The system consists of two parts:
@@ -58,18 +60,18 @@ You need to tell Claude how to start the MCP server.
 
 4. Restart Claude Desktop.
 
-### 3. Usage Example
+### 3. Usage Examples
 Once connected, you can ask Claude to do things in AODT!
 
 **Vibe Coding Prompts:**
-- *"Check the AODT status using your tool."*
-- *"Create a red cube in the AODT stage."*
-- *"List all the prims currently in the USD stage."*
-- *"Set up a basic radio unit using the aerial python API."*
+- *"Search for a Berlin scene in my assets."*
+- *"List the current stage hierarchy to see what's loaded."*
+- *"Create a red cube at the origin."*
+- *"Move all antennas in the scene up by 5 meters."*
 
 ## Troubleshooting
-- **Connection Refused**: Ensure the script is actually running inside AODT's Script Editor. Check the Omniverse console for errors.
-- **Port in Use**: If port 9876 is taken, you can change the `PORT` variable in both `aodt_socket_server.py` and `mcp_server.py`.
+- **Connection Refused**: Ensure the **AODT MCP Server Extension** is enabled in the Extension Manager. Check the console for `[AODT-MCP] Started socket server`.
+- **Port in Use**: If port 9876 is taken (e.g., by Blender MCP), close the other application or change the `PORT` variable in `exts/aodt.mcp_server/aodt/mcp_server/__init__.py` and `mcp_server.py`.
 
 ## License
 MIT License. Feel free to contribute, open issues, or submit PRs!

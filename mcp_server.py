@@ -75,6 +75,74 @@ def execute_aodt_command(code: str) -> str:
         error_msg = response.get("message", "Unknown error")
         return f"Execution Failed:\n{error_msg}"
 
+@mcp.tool()
+def get_aodt_stage_hierarchy() -> str:
+    """
+    Returns a text-based tree representing the current USD stage hierarchy in AODT.
+    Use this to understand what objects (prims) are currently loaded and their paths.
+    """
+    code = """
+import omni.usd
+stage = omni.usd.get_context().get_stage()
+def traverse(prim, indent=0):
+    lines = [f"{'  ' * indent}{prim.GetPath().pathString} [{prim.GetTypeName()}]"]
+    for child in prim.GetChildren():
+        lines.extend(traverse(child, indent + 1))
+    return lines
+
+if stage:
+    hierarchy = traverse(stage.GetPseudoRoot())
+    print("\\n".join(hierarchy))
+else:
+    print("No active stage found.")
+"""
+    response = send_to_aodt("execute", {"code": code})
+    if response.get("status") == "success":
+        return response.get("result", "No hierarchy found.")
+    return f"Failed to get hierarchy: {response.get('message')}"
+
+@mcp.tool()
+def search_aodt_assets(query: str) -> str:
+    """
+    Searches for USD assets within common AODT and Omniverse paths.
+    
+    Args:
+        query: Search term for the asset (e.g., 'berlin', 'antenna').
+    """
+    # This script searches in typical Omniverse paths and common local aodt folders
+    code = f"""
+import os
+import glob
+
+search_paths = [
+    "/home/sal-garfield/.local/share/ov/pkg/aodt-1.4.1/assets",
+    "/home/sal-garfield/aodt_1.4.1/assets",
+    "/home/sal-garfield/Documents/Kit/shared/exts"
+]
+
+found_files = []
+for path in search_paths:
+    if os.path.exists(path):
+        # Recursive search for .usd files containing the query
+        for root, dirs, files in os.walk(path):
+            for file in files:
+                if "{query}".lower() in file.lower() and file.endswith(('.usd', '.usda', '.usdc')):
+                    found_files.append(os.path.join(root, file))
+
+if found_files:
+    print(f"Found {{len(found_files)}} assets matching '{query}':")
+    for f in found_files[:15]: # Limit to 15 results
+        print(f"- {{f}}")
+    if len(found_files) > 15:
+        print("... and more.")
+else:
+    print(f"No assets matching '{query}' found in common search paths.")
+"""
+    response = send_to_aodt("execute", {"code": code})
+    if response.get("status") == "success":
+        return response.get("result", "Search failed.")
+    return f"Asset search error: {response.get('message')}"
+
 @mcp.resource("aodt://status")
 def get_aodt_status() -> str:
     """Check if AODT is reachable and get its current status."""
