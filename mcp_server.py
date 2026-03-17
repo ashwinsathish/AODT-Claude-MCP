@@ -129,39 +129,57 @@ else:
 @mcp.tool()
 def search_aodt_assets(query: str) -> str:
     """
-    Searches for USD assets within common AODT and Omniverse paths.
+    Searches for USD assets within local paths and Omniverse Nucleus server.
     
     Args:
-        query: Search term for the asset (e.g., 'berlin', 'antenna').
+        query: Search term for the asset (e.g., 'tokyo', 'berlin').
     """
-    # This script searches in typical Omniverse paths and common local aodt folders
     code = f"""
 import os
-import glob
+import omni.client
 
 search_paths = [
     "/home/sal-garfield/.local/share/ov/pkg/aodt-1.4.1/assets",
     "/home/sal-garfield/aodt_1.4.1/assets",
-    "/home/sal-garfield/Documents/Kit/shared/exts"
+    "omniverse://omniverse-server/Users/aerial",
+    "omniverse://omniverse-server/Projects",
+    "omniverse://omniverse-server/NVIDIA/Assets/DigitalTwin"
 ]
 
 found_files = []
+
+# 1. Search Local Files
 for path in search_paths:
-    if os.path.exists(path):
-        # Recursive search for .usd files containing the query
+    if path.startswith("/") and os.path.exists(path):
         for root, dirs, files in os.walk(path):
             for file in files:
                 if "{query}".lower() in file.lower() and file.endswith(('.usd', '.usda', '.usdc')):
                     found_files.append(os.path.join(root, file))
 
+# 2. Search Nucleus Files (Recursive list)
+def search_nucleus(base_path, query, results, depth=0, max_depth=3):
+    if depth > max_depth:
+        return
+    res, entries = omni.client.list(base_path)
+    if res == omni.client.Result.OK:
+        for entry in entries:
+            name = entry.relative_path
+            full_path = base_path + "/" + name
+            if "{query}".lower() in name.lower() and name.endswith(('.usd', '.usda', '.usdc')):
+                results.append(full_path)
+            if entry.flags & omni.client.ItemFlags.CAN_HAVE_CHILDREN:
+                search_nucleus(full_path, query, results, depth + 1, max_depth)
+
+for path in search_paths:
+    if path.startswith("omniverse://"):
+        search_nucleus(path, "{query}", found_files)
+
 if found_files:
     print(f"Found {{len(found_files)}} assets matching '{query}':")
-    for f in found_files[:15]: # Limit to 15 results
+    for f in found_files[:15]:
         print(f"- {{f}}")
-    if len(found_files) > 15:
-        print("... and more.")
 else:
-    print(f"No assets matching '{query}' found in common search paths.")
+    print(f"No assets matching '{query}' found in local or Nucleus paths.")
 """
     response = send_to_aodt("execute", {"code": code})
     if response.get("status") == "success":
