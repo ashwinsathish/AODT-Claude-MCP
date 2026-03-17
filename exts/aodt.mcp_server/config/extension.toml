@@ -1,0 +1,19 @@
+[package]
+# Semantic Versioning is used: https://semver.org/
+version = "1.0.0"
+
+# The title and description of the extension
+title = "AODT MCP Server Extension"
+description = "A background socket server to allow Claude to control AODT via MCP."
+
+# Optional, adds authors/maintainers
+authors = ["Antigravity <antigravity@example.com>"]
+
+# The actual python module to load
+[[python.module]]
+name = "aodt.mcp_server"
+
+# The module dependency on kit core
+[dependencies]
+"omni.kit.uiapp" = {}
+"omni.kit.commands" = {}
