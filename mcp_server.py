@@ -76,29 +76,53 @@ def execute_aodt_command(code: str) -> str:
         return f"Execution Failed:\n{error_msg}"
 
 @mcp.tool()
-def get_aodt_stage_hierarchy() -> str:
+def get_aodt_stage_hierarchy(max_depth: int = 3) -> str:
     """
     Returns a text-based tree representing the current USD stage hierarchy in AODT.
-    Use this to understand what objects (prims) are currently loaded and their paths.
+    
+    Args:
+        max_depth: Maximum depth to traverse (default is 3). Increase this if you need to see deeper nesting.
     """
-    code = """
+    code = f"""
 import omni.usd
 stage = omni.usd.get_context().get_stage()
-def traverse(prim, indent=0):
-    lines = [f"{'  ' * indent}{prim.GetPath().pathString} [{prim.GetTypeName()}]"]
-    for child in prim.GetChildren():
-        lines.extend(traverse(child, indent + 1))
+
+def traverse(prim, current_depth, max_depth):
+    if current_depth > max_depth:
+        return []
+    
+    # Format current prim
+    line = "{'  ' * current_depth}" + str(prim.GetPath()) + " [" + prim.GetTypeName() + "]"
+    lines = [line]
+    
+    children = prim.GetChildren()
+    if children:
+        if current_depth == max_depth:
+            lines.append("{'  ' * (current_depth + 1)}... (children truncated, increase max_depth to see more)")
+        else:
+            for child in children:
+                lines.extend(traverse(child, current_depth + 1, max_depth))
     return lines
 
 if stage:
-    hierarchy = traverse(stage.GetPseudoRoot())
+    # Typical AODT stages can have millions of prims (grass, particles, etc)
+    # We traverse from pseudo-root
+    hierarchy = traverse(stage.GetPseudoRoot(), 0, {max_depth})
     print("\\n".join(hierarchy))
+    
+    # Also print a summary count
+    total_prims = len(list(stage.Traverse()))
+    print(f"\\n--- Summary: Total Prims in Stage: {{total_prims}} ---")
 else:
     print("No active stage found.")
 """
     response = send_to_aodt("execute", {"code": code})
     if response.get("status") == "success":
-        return response.get("result", "No hierarchy found.")
+        result = response.get("result", "No hierarchy found.")
+        # Final safety truncation for the MCP response string itself
+        if len(result) > 50000:
+            result = result[:50000] + "\n... (Response truncated by MCP server for length) ..."
+        return result
     return f"Failed to get hierarchy: {response.get('message')}"
 
 @mcp.tool()
