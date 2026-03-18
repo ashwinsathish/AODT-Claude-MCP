@@ -159,10 +159,17 @@ class AODTSocketServer:
         if not finished:
             return {"status": "error", "message": "Execution timed out on the main thread."}
             
+        MAX_OUTPUT = 100_000  # chars; prevents unbounded socket transfers
         if result_container["status"] == "error":
-            return {"status": "error", "message": result_container["error"] + "\nOutput:\n" + result_container["output"]}
-            
-        return {"status": "success", "result": result_container["output"]}
+            msg = result_container["error"] + "\nOutput:\n" + result_container["output"]
+            if len(msg) > MAX_OUTPUT:
+                msg = msg[:MAX_OUTPUT] + "\n... (output truncated at extension level)"
+            return {"status": "error", "message": msg}
+
+        result = result_container["output"]
+        if len(result) > MAX_OUTPUT:
+            result = result[:MAX_OUTPUT] + "\n... (output truncated at extension level)"
+        return {"status": "success", "result": result}
 
 # Global instance
 _mcp_server = None

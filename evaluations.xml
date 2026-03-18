@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AODT MCP Server Evaluations
+  ===========================
+  Prerequisites:
+    - AODT is running with the aodt.mcp_server extension enabled (port 9876)
+    - The Kit test USD files at /home/sal-garfield/.local/share/ov/pkg/aodt-1.4.1/
+      are accessible from within AODT
+
+  Each question requires the LLM to call one or more MCP tools and report the result.
+  Answers are verified by exact string match (case-insensitive where noted).
+
+  Test files used:
+    CUBE   = .../omni.kit.widget.stage/data/tests/usd/cube.usda
+    LIGHTS = .../omni.kit.widget.stage/data/tests/4Lights.usda
+-->
+<evaluation>
+
+  <!--
+    Q1 — Basic stage loading + find_prims by type
+    Tools: load_stage, find_prims
+    Verifies: type-filter search returns correct count on a known scene
+  -->
+  <qa_pair>
+    <question>
+      Load the stage at
+      /home/sal-garfield/.local/share/ov/pkg/aodt-1.4.1/kit/exts/omni.kit.widget.stage/data/tests/4Lights.usda
+      then call find_prims with type_filter set to 'SphereLight'.
+      How many prims are returned?
+    </question>
+    <answer>4</answer>
+  </qa_pair>
+
+  <!--
+    Q2 — Attribute inspection on a specific prim
+    Tools: load_stage, get_prim_attribute
+    Verifies: correct attribute value retrieval from a light prim
+  -->
+  <qa_pair>
+    <question>
+      Load the stage at
+      /home/sal-garfield/.local/share/ov/pkg/aodt-1.4.1/kit/exts/omni.kit.widget.stage/data/tests/4Lights.usda
+      then get the 'intensity' attribute of the prim at /Stage/SphereLight_01.
+      What is the numeric value of the intensity?
+    </question>
+    <answer>30000</answer>
+  </qa_pair>
+
+  <!--
+    Q3 — Stage metadata inspection
+    Tools: load_stage, get_stage_info
+    Verifies: up-axis is correctly read from stage metadata
+  -->
+  <qa_pair>
+    <question>
+      Load the stage at
+      /home/sal-garfield/.local/share/ov/pkg/aodt-1.4.1/kit/exts/omni.kit.widget.stage/data/tests/usd/cube.usda
+      then call get_stage_info.
+      What letter is reported as the Up Axis?
+    </question>
+    <answer>Y</answer>
+  </qa_pair>
+
+  <!--
+    Q4 — Prim type lookup
+    Tools: load_stage, get_prim_info
+    Verifies: USD schema type name is correctly reported for a Cube prim
+  -->
+  <qa_pair>
+    <question>
+      Load the stage at
+      /home/sal-garfield/.local/share/ov/pkg/aodt-1.4.1/kit/exts/omni.kit.widget.stage/data/tests/usd/cube.usda
+      then call get_prim_info on the prim at /World/Cube.
+      What USD type name is reported for that prim?
+    </question>
+    <answer>Cube</answer>
+  </qa_pair>
+
+  <!--
+    Q5 — Scalar attribute read
+    Tools: load_stage, get_prim_attribute
+    Verifies: numeric attribute retrieval from a geometry prim
+  -->
+  <qa_pair>
+    <question>
+      Load the stage at
+      /home/sal-garfield/.local/share/ov/pkg/aodt-1.4.1/kit/exts/omni.kit.widget.stage/data/tests/usd/cube.usda
+      then get the 'size' attribute of the prim at /World/Cube.
+      What is the numeric value of the size?
+    </question>
+    <answer>100</answer>
+  </qa_pair>
+
+  <!--
+    Q6 — Type disambiguation (Cube schema vs Mesh schema)
+    Tools: load_stage, get_prim_info
+    Verifies: LLM correctly distinguishes a USD Mesh named "Cube" from a USD Cube primitive
+  -->
+  <qa_pair>
+    <question>
+      Load the stage at
+      /home/sal-garfield/.local/share/ov/pkg/aodt-1.4.1/kit/exts/omni.kit.widget.stage/data/tests/4Lights.usda
+      then call get_prim_info on the prim at /Stage/Cube.
+      What USD type name is reported for that prim?
+    </question>
+    <answer>Mesh</answer>
+  </qa_pair>
+
+  <!--
+    Q7 — Stage prim count
+    Tools: load_stage, get_stage_info
+    Verifies: total prim count on a minimal stage (World + Cube = 2)
+  -->
+  <qa_pair>
+    <question>
+      Load the stage at
+      /home/sal-garfield/.local/share/ov/pkg/aodt-1.4.1/kit/exts/omni.kit.widget.stage/data/tests/usd/cube.usda
+      then call get_stage_info.
+      What integer is reported as the Total Prims count?
+    </question>
+    <answer>2</answer>
+  </qa_pair>
+
+  <!--
+    Q8 — Transform read + rounding
+    Tools: load_stage, get_prim_transform
+    Verifies: correct translation retrieval and requires numeric interpretation
+  -->
+  <qa_pair>
+    <question>
+      Load the stage at
+      /home/sal-garfield/.local/share/ov/pkg/aodt-1.4.1/kit/exts/omni.kit.widget.stage/data/tests/usd/cube.usda
+      then call get_prim_transform on /World/Cube.
+      What is the local X translation value, rounded to the nearest integer?
+    </question>
+    <answer>-158</answer>
+  </qa_pair>
+
+  <!--
+    Q9 — Prim creation and verification
+    Tools: load_stage, create_prim, get_prim_info
+    Verifies: created prims are immediately queryable and have the correct type
+  -->
+  <qa_pair>
+    <question>
+      Load the stage at
+      /home/sal-garfield/.local/share/ov/pkg/aodt-1.4.1/kit/exts/omni.kit.widget.stage/data/tests/usd/cube.usda
+      then create a new prim at /World/TestSphere with type Sphere.
+      After creation, call get_prim_info on /World/TestSphere.
+      What USD type name is reported?
+    </question>
+    <answer>Sphere</answer>
+  </qa_pair>
+
+  <!--
+    Q10 — Timeline state inspection
+    Tools: load_stage, get_simulation_status
+    Verifies: simulation reports correct idle state immediately after stage load
+  -->
+  <qa_pair>
+    <question>
+      Load the stage at
+      /home/sal-garfield/.local/share/ov/pkg/aodt-1.4.1/kit/exts/omni.kit.widget.stage/data/tests/usd/cube.usda
+      then call get_simulation_status without starting the simulation.
+      What single word is reported as the simulation State?
+    </question>
+    <answer>stopped</answer>
+  </qa_pair>
+
+</evaluation>
