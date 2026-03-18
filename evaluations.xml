@@ -3,7 +3,7 @@
   AODT MCP Server Evaluations
   ===========================
   Prerequisites:
-    - AODT is running with the aodt.mcp_server extension enabled (port 9876)
+    - AODT is running with the aodt.mcp_server extension enabled (port 8765)
     - The Kit test USD files at /home/sal-garfield/.local/share/ov/pkg/aodt-1.4.1/
       are accessible from within AODT
 

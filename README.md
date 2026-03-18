@@ -21,7 +21,7 @@ Claude / MCP Client
        │  stdio (MCP protocol)
        ▼
   mcp_server.py          ← FastMCP bridge (this repo)
-       │  TCP JSON (port 9876)
+       │  TCP JSON (port 8765)
        ▼
   aodt.mcp_server         ← Omniverse Kit extension (this repo)
   (runs inside AODT)
@@ -140,7 +140,7 @@ Two components ship in this repo:
 4. Click the **Gear icon** (Settings) and add the `exts/` folder of this repository to the **Extension Search Paths**.
 5. Search for **AODT MCP Server** and toggle it **Enabled**. The console should print:
    ```
-   [AODT-MCP] Started socket server on 0.0.0.0:9876
+   [AODT-MCP] Started socket server on 0.0.0.0:8765
    ```
 
 ### 2. Configure Claude Desktop
@@ -205,7 +205,7 @@ Undo the last change.
 
 | Problem | Fix |
 |---|---|
-| **Connection refused** | Ensure the **AODT MCP Server** extension is enabled and the console shows `Started socket server on 0.0.0.0:9876` |
+| **Connection refused** | Ensure the **AODT MCP Server** extension is enabled and the console shows `Started socket server on 0.0.0.0:8765` |
 | **Port conflict** | Change `PORT` in both `mcp_server.py` and `exts/aodt.mcp_server/aodt/mcp_server/__init__.py` |
 | **Execution timeout** | Long-running code hits the 10 s timeout. Break it into smaller calls or use `execute_aodt_command` with async-safe code |
 | **AODT entities not found** | Ensure an AODT scene is loaded (not a blank stage) before calling `create_ru`, `create_ue`, etc. |

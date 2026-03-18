@@ -4,7 +4,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 AODT_HOST = "localhost"
-AODT_PORT = 9876
+AODT_PORT = 8765
 
 mcp = FastMCP("Nvidia AODT MCP Server")
 

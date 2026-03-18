@@ -9,7 +9,7 @@ import omni.ext
 import omni.kit.app
 
 HOST = "0.0.0.0"
-PORT = 9876
+PORT = 8765
 
 class AODTSocketServer:
     def __init__(self):
