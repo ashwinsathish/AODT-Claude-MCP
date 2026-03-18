@@ -1,6 +1,6 @@
 # NVIDIA Aerial Omniverse Digital Twin (AODT) MCP Server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server that gives Claude (or any MCP client) complete programmatic control over a running [NVIDIA AODT](https://developer.nvidia.com/aerial-omniverse-digital-twin) session. A complete novice can operate AODT entirely through natural language — no GUI required.
+A [Model Context Protocol](https://modelcontextprotocol.io) server that gives Claude (or any MCP client) complete programmatic control over a running [NVIDIA AODT](https://developer.nvidia.com/aerial-omniverse-digital-twin) session. 
 
 ## What you can do
 
