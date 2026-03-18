@@ -7,7 +7,7 @@ title = "AODT MCP Server Extension"
 description = "A background socket server to allow Claude to control AODT via MCP."
 
 # Optional, adds authors/maintainers
-authors = ["Antigravity <antigravity@example.com>"]
+authors = ["Ashwin Sathish"]
 
 # The actual python module to load
 [[python.module]]
