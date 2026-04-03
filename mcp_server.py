@@ -11,6 +11,22 @@ AODT_PORT = 8765
 mcp = FastMCP("Nvidia AODT MCP Server")
 
 
+_WRITABLE_EDIT_TARGET_SNIPPET = """
+ctx = omni.usd.get_context()
+stage = ctx.get_stage()
+if stage:
+    try:
+        layer = stage.GetEditTarget().GetLayer()
+        if layer and (not layer.PermissionToEdit()):
+            session_layer = stage.GetSessionLayer()
+            if session_layer:
+                stage.SetEditTarget(session_layer)
+                print(f"Info: switched edit target to session layer: {session_layer.identifier}")
+    except Exception as _edit_err:
+        print(f"Warning: automatic edit-target switch failed: {_edit_err}")
+"""
+
+
 # ─── Transport helpers ────────────────────────────────────────────────────────
 
 def _send(command_type: str, params: dict = None) -> dict:
@@ -472,7 +488,10 @@ def create_prim(prim_path: str, prim_type: str = "Xform") -> str:
 import omni.usd, omni.kit.commands
 _path = {json.dumps(prim_path)}
 _type = {json.dumps(prim_type)}
-stage = omni.usd.get_context().get_stage()
+{_WRITABLE_EDIT_TARGET_SNIPPET}
+if not stage:
+    print("Error: no stage loaded.")
+    raise SystemExit
 if stage.GetPrimAtPath(_path).IsValid():
     print(f"Error: prim already exists at '{{_path}}'")
 else:
@@ -494,7 +513,10 @@ def delete_prim(prim_path: str) -> str:
     code = f"""
 import omni.usd, omni.kit.commands
 _path = {json.dumps(prim_path)}
-stage = omni.usd.get_context().get_stage()
+{_WRITABLE_EDIT_TARGET_SNIPPET}
+if not stage:
+    print("Error: no stage loaded.")
+    raise SystemExit
 if not stage.GetPrimAtPath(_path).IsValid():
     print(f"Error: no prim at '{{_path}}'")
 else:
@@ -518,7 +540,10 @@ def duplicate_prim(source_path: str, dest_path: str) -> str:
 import omni.usd, omni.kit.commands
 _src = {json.dumps(source_path)}
 _dst = {json.dumps(dest_path)}
-stage = omni.usd.get_context().get_stage()
+{_WRITABLE_EDIT_TARGET_SNIPPET}
+if not stage:
+    print("Error: no stage loaded.")
+    raise SystemExit
 if not stage.GetPrimAtPath(_src).IsValid():
     print(f"Error: source prim not found at '{{_src}}'")
 elif stage.GetPrimAtPath(_dst).IsValid():
@@ -546,7 +571,10 @@ import omni.usd
 from pxr import UsdGeom
 _path    = {json.dumps(prim_path)}
 _visible = {str(visible)}
-stage = omni.usd.get_context().get_stage()
+{_WRITABLE_EDIT_TARGET_SNIPPET}
+if not stage:
+    print("Error: no stage loaded.")
+    raise SystemExit
 prim  = stage.GetPrimAtPath(_path)
 if not prim.IsValid():
     print(f"Error: no prim at '{{_path}}'")
@@ -618,7 +646,10 @@ def _infer_and_cast(string_value, prim, attname):
         return Sdf.ValueTypeNames.IntArray, Vt.IntArray([int(v) for v in parsed])
     return Sdf.ValueTypeNames.String, string_value
 
-stage = omni.usd.get_context().get_stage()
+{_WRITABLE_EDIT_TARGET_SNIPPET}
+if not stage:
+    print("Error: no stage loaded.")
+    raise SystemExit
 prim  = stage.GetPrimAtPath(_path)
 if not prim.IsValid():
     print(f"Error: no prim at '{{_path}}'")
@@ -705,7 +736,10 @@ _path = {json.dumps(prim_path)}
 _pos  = {json.dumps(position)}
 _rot  = {json.dumps(rotation)}
 _scl  = {json.dumps(scale)}
-stage = omni.usd.get_context().get_stage()
+{_WRITABLE_EDIT_TARGET_SNIPPET}
+if not stage:
+    print("Error: no stage loaded.")
+    raise SystemExit
 prim  = stage.GetPrimAtPath(_path)
 if not prim.IsValid():
     print(f"Error: no prim at '{{_path}}'")
@@ -738,7 +772,7 @@ else:
 # ─── 7. Viewport & selection ──────────────────────────────────────────────────
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
-def select_and_focus_prims(prim_paths: list[str]) -> str:
+def select_and_focus_prims(prim_paths: list[str], frame: bool = False) -> str:
     """
     Selects the given prims in the stage and moves the viewport camera to frame them.
     Use this to quickly navigate to any object by path.
@@ -746,6 +780,7 @@ def select_and_focus_prims(prim_paths: list[str]) -> str:
     Args:
         prim_paths: List of USD paths to select and frame
                     (e.g. ['/RUs/ru_0001'] or ['/World/Cube', '/World/Sphere']).
+        frame: If True, attempts viewport framing. Default False for stability.
     """
     code = f"""
 import omni.usd, omni.kit.commands
@@ -753,6 +788,7 @@ from omni.kit.viewport.utility import get_active_viewport
 from pxr import Usd, UsdGeom, Sdf
 
 _paths = {json.dumps(prim_paths)}
+_frame = {str(frame)}
 ctx    = omni.usd.get_context()
 stage  = ctx.get_stage()
 
@@ -764,24 +800,28 @@ if not valid:
     print("Error: no valid paths to select.")
 else:
     ctx.get_selection().set_selected_prim_paths(valid, False)
-    # Frame the selection using the active viewport camera
-    viewport = get_active_viewport()
-    if viewport:
-        camera_path = viewport.camera_path
-        time_code   = Usd.TimeCode.Default()
-        resolution  = viewport.resolution
-        aspect      = resolution[0] / resolution[1] if resolution[1] else 1.0
-        omni.kit.commands.execute(
-            'FramePrimsCommand',
-            prim_to_move=camera_path,
-            prims_to_frame=valid,
-            time_code=time_code,
-            aspect_ratio=aspect,
-            zoom=0.6,
-        )
-        print(f"Selected and framed: {{valid}}")
+    if _frame:
+        # Frame the selection using the active viewport camera.
+        # This can be unstable on some heavy scenes, so it's opt-in.
+        viewport = get_active_viewport()
+        if viewport:
+            camera_path = viewport.camera_path
+            time_code   = Usd.TimeCode.Default()
+            resolution  = viewport.resolution
+            aspect      = resolution[0] / resolution[1] if resolution[1] else 1.0
+            omni.kit.commands.execute(
+                'FramePrimsCommand',
+                prim_to_move=camera_path,
+                prims_to_frame=valid,
+                time_code=time_code,
+                aspect_ratio=aspect,
+                zoom=0.6,
+            )
+            print(f"Selected and framed: {{valid}}")
+        else:
+            print(f"Selected: {{valid}} (no active viewport to frame)")
     else:
-        print(f"Selected: {{valid}} (no active viewport to frame)")
+        print(f"Selected: {{valid}} (framing disabled by default for stability)")
 """
     return _run(code)
 
@@ -1561,7 +1601,10 @@ from aodt.telemetry import TelemetryExt
 _ru_path = {json.dumps(ru_prim_path)}
 _ue_path = {json.dumps(ue_prim_path)}
 _enabled = {str(enabled)}
-stage = omni.usd.get_context().get_stage()
+{_WRITABLE_EDIT_TARGET_SNIPPET}
+if not stage:
+    print("Error: no stage loaded.")
+    raise SystemExit
 ru = stage.GetPrimAtPath(_ru_path)
 ue = stage.GetPrimAtPath(_ue_path)
 if not ru.IsValid():
@@ -1635,6 +1678,9 @@ def list_network_entities() -> str:
 import omni.usd
 from pxr import UsdGeom, Usd
 stage = omni.usd.get_context().get_stage()
+if not stage:
+    print("Error: no stage loaded.")
+    raise SystemExit
 
 def list_entity_group(path_str, label):
     parent = stage.GetPrimAtPath(path_str)
@@ -1667,10 +1713,12 @@ def create_panel() -> str:
     """
     Creates a new panel prim under /Panels with the next available ID.
     """
-    return _run("""
+    return _run(f"""
+import omni.usd
+{_WRITABLE_EDIT_TARGET_SNIPPET}
 from aodt.common.prims import create_panel_prim
 path = create_panel_prim()
-print(f"Panel created at {path}")
+print(f"Panel created at {{path}}")
 """)
 
 
@@ -1712,7 +1760,10 @@ import omni.usd
 from pxr import Sdf
 _ru = {json.dumps(ru_panel_name)}
 _ue = {json.dumps(ue_panel_name)}
-stage = omni.usd.get_context().get_stage()
+{_WRITABLE_EDIT_TARGET_SNIPPET}
+if not stage:
+    print("Error: no stage loaded.")
+    raise SystemExit
 scenario = stage.GetPrimAtPath("/Scenario")
 if not scenario.IsValid():
     print("Error: /Scenario prim not found.")
@@ -1752,7 +1803,10 @@ from aodt.common.utils import get_scale_factor, get_stage_meters_per_unit
 
 _pos_in = {json.dumps(position)}
 _units = {json.dumps(position_units)}.lower()
-stage = omni.usd.get_context().get_stage()
+{_WRITABLE_EDIT_TARGET_SNIPPET}
+if not stage:
+    print("Error: no stage loaded.")
+    raise SystemExit
 stage_units = get_stage_meters_per_unit()
 
 if _units in ("meter", "meters", "m"):
@@ -1829,7 +1883,10 @@ from aodt.deployer.model import get_ru_model_instance
 
 _pos_in = {json.dumps(position)}
 _units = {json.dumps(position_units)}.lower()
-stage = omni.usd.get_context().get_stage()
+{_WRITABLE_EDIT_TARGET_SNIPPET}
+if not stage:
+    print("Error: no stage loaded.")
+    raise SystemExit
 stage_units = get_stage_meters_per_unit()
 
 if _units in ("meter", "meters", "m"):
@@ -1903,7 +1960,10 @@ from aodt.deployer.model import DU_TO_BUILDING_METERS, MIN_DU_Z_METERS, get_ru_m
 
 _pos_in = {json.dumps(position)}
 _units = {json.dumps(position_units)}.lower()
-stage = omni.usd.get_context().get_stage()
+{_WRITABLE_EDIT_TARGET_SNIPPET}
+if not stage:
+    print("Error: no stage loaded.")
+    raise SystemExit
 stage_units = get_stage_meters_per_unit()
 
 if _units in ("meter", "meters", "m"):
@@ -1974,7 +2034,7 @@ _tx_in = {json.dumps(tx_position)}
 _rx_in = {json.dumps(rx_position)}
 _units = {json.dumps(position_units)}.lower()
 _enable_rays = {str(enable_rays)}
-stage = omni.usd.get_context().get_stage()
+{_WRITABLE_EDIT_TARGET_SNIPPET}
 if not stage:
     print("Error: no stage loaded.")
     raise SystemExit
