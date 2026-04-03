@@ -2369,6 +2369,8 @@ def _get_guarded_operation_registry() -> dict:
         "new_stage": new_stage,
         "load_stage": load_stage,
         "save_stage": save_stage,
+        "list_network_entities": list_network_entities,
+        "get_scenario_info": get_scenario_info,
         "create_panel": create_panel,
         "list_panels": list_panels,
         "set_default_panels": set_default_panels,
@@ -2406,6 +2408,8 @@ def _execute_guarded_operation_internal(operation: str, args: dict, auto_fix: bo
 
     stage_required = {
         "save_stage",
+        "list_network_entities",
+        "get_scenario_info",
         "create_panel",
         "list_panels",
         "set_default_panels",
@@ -2653,7 +2657,7 @@ def get_workflow_contracts() -> str:
     """
     payload = {
         "use_for_natural_language_control": True,
-        "preferred_executor": "execute_guarded_operation",
+        "preferred_executor": "autonomous_aodt_task",
         "supported_operations": sorted(_get_guarded_operation_registry().keys()),
         "precondition_summary": {
             "worker_required": ["generate_mobility", "start_simulation"],
@@ -2768,6 +2772,119 @@ def execute_guarded_sequence(steps_json: str, auto_fix: bool = True, stop_on_err
         "results": results,
     }
     return json.dumps(payload, indent=2)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+def autonomous_aodt_task(task: str, auto_fix: bool = True) -> str:
+    """
+    High-level autonomous entrypoint for natural-language AODT requests.
+    It infers a guarded operation/sequence, runs it with workflow checks,
+    and returns structured execution + verification output.
+    """
+    t = (task or "").strip()
+    n = t.lower()
+    if not t:
+        return json.dumps({"success": False, "error": "task must be a non-empty string."}, indent=2)
+
+    def run_op(op: str, args: dict | None = None):
+        return _execute_guarded_operation_internal(operation=op, args=args or {}, auto_fix=auto_fix)
+
+    result = {"success": False, "task": t, "mode": "autonomous", "actions": []}
+
+    # TX/RX creation intent (most common failure-prone workflow)
+    if (("transmitter" in n or " tx" in n or "tx " in n) and ("receiver" in n or " rx" in n or "rx " in n)) or ("tx/rx" in n):
+        coord_matches = re.findall(r"\[([^\]]+)\]", t)
+        tx = [0.0, 0.0, 10.0]
+        rx = [60.0, 0.0, 1.5]
+        units = "meters"
+        if "centimeter" in n or " cm" in n:
+            units = "centimeters"
+        if "stage unit" in n or "stage units" in n:
+            units = "stage"
+        try:
+            if len(coord_matches) >= 2:
+                tx_vals = [float(x.strip()) for x in coord_matches[0].split(",")]
+                rx_vals = [float(x.strip()) for x in coord_matches[1].split(",")]
+                if len(tx_vals) == 3 and len(rx_vals) == 3:
+                    tx, rx = tx_vals, rx_vals
+        except Exception:
+            pass
+
+        a1 = run_op(
+            "create_tx_rx_pair",
+            {"tx_position": tx, "rx_position": rx, "position_units": units, "enable_rays": True},
+        )
+        result["actions"].append({"operation": "create_tx_rx_pair", "result": a1})
+        if not a1.get("success", False):
+            result["success"] = False
+            return json.dumps(result, indent=2)
+
+        a2 = run_op("list_network_entities", {})
+        result["actions"].append({"operation": "list_network_entities", "result": a2})
+        a3 = run_op("validate_control_readiness", {"require_live_session": False, "require_saved_stage": False})
+        result["actions"].append({"operation": "validate_control_readiness", "result": a3})
+        result["success"] = True
+        return json.dumps(result, indent=2)
+
+    if ("list" in n and ("network" in n or "ru" in n or "ue" in n or "du" in n)) or ("entities" in n):
+        a = run_op("list_network_entities", {})
+        result["actions"].append({"operation": "list_network_entities", "result": a})
+        result["success"] = bool(a.get("success", False))
+        return json.dumps(result, indent=2)
+
+    if "readiness" in n or "preflight" in n:
+        a = run_op("validate_control_readiness", {"require_live_session": False, "require_saved_stage": False})
+        result["actions"].append({"operation": "validate_control_readiness", "result": a})
+        result["success"] = bool(a.get("success", False))
+        return json.dumps(result, indent=2)
+
+    if "mobility" in n and ("generate" in n or "sync" in n):
+        a1 = run_op("generate_mobility", {})
+        result["actions"].append({"operation": "generate_mobility", "result": a1})
+        if a1.get("success", False):
+            a2 = run_op("wait_for_mobility_sync", {"timeout_seconds": 180, "poll_interval_seconds": 1.0})
+            result["actions"].append({"operation": "wait_for_mobility_sync", "result": a2})
+            result["success"] = bool(a2.get("success", False))
+        else:
+            result["success"] = False
+        return json.dumps(result, indent=2)
+
+    if "start sim" in n or "start simulation" in n or "run simulation" in n:
+        a1 = run_op("start_simulation", {})
+        result["actions"].append({"operation": "start_simulation", "result": a1})
+        if a1.get("success", False):
+            a2 = run_op("wait_for_sim_completion", {"timeout_seconds": 240, "poll_interval_seconds": 1.0})
+            result["actions"].append({"operation": "wait_for_sim_completion", "result": a2})
+            result["success"] = bool(a2.get("success", False))
+        else:
+            result["success"] = False
+        return json.dumps(result, indent=2)
+
+    if "stop simulation" in n or "pause simulation" in n:
+        a = run_op("stop_simulation", {})
+        result["actions"].append({"operation": "stop_simulation", "result": a})
+        result["success"] = bool(a.get("success", False))
+        return json.dumps(result, indent=2)
+
+    if "reset simulation" in n or "reset sim" in n:
+        a = run_op("reset_simulation", {})
+        result["actions"].append({"operation": "reset_simulation", "result": a})
+        result["success"] = bool(a.get("success", False))
+        return json.dumps(result, indent=2)
+
+    if "log" in n:
+        a = run_op("get_recent_aodt_logs", {"max_lines": 200})
+        result["actions"].append({"operation": "get_recent_aodt_logs", "result": a})
+        result["success"] = bool(a.get("success", False))
+        return json.dumps(result, indent=2)
+
+    # Fallback with explicit contract guidance so agent can continue autonomously.
+    result["error"] = (
+        "Could not infer a safe operation from task text. "
+        "Use get_workflow_contracts and execute_guarded_operation/sequence."
+    )
+    result["supported_operations"] = sorted(_get_guarded_operation_registry().keys())
+    return json.dumps(result, indent=2)
 
 
 # ─── 14. Raw execution ────────────────────────────────────────────────────────
