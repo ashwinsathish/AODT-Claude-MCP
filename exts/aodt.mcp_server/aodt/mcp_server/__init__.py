@@ -4,11 +4,12 @@ import threading
 import traceback
 import sys
 import io
+import os
 
 import omni.ext
 import omni.kit.app
 
-HOST = "0.0.0.0"
+HOST = os.getenv("AODT_MCP_HOST", "127.0.0.1")
 PORT = 8765
 
 class AODTSocketServer:
@@ -153,8 +154,8 @@ class AODTSocketServer:
         # Subscribe to the next frame update to run the task on the main thread
         sub[0] = omni.kit.app.get_app().get_update_event_stream().create_subscription_to_pop(on_update)
         
-        # Wait for the task to finish (timeout after 10 seconds)
-        finished = done_event.wait(10.0)
+        # Wait for the task to finish (timeout after 120 seconds — allows Nucleus asset loading)
+        finished = done_event.wait(120.0)
         
         if not finished:
             return {"status": "error", "message": "Execution timed out on the main thread."}

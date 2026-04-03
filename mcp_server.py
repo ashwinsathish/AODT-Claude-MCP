@@ -1,4 +1,5 @@
 import json
+import re
 import socket
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -16,7 +17,7 @@ def _send(command_type: str, params: dict = None) -> dict:
     payload = {"type": command_type, "params": params or {}}
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(10.0)
+            s.settimeout(120.0)
             s.connect((AODT_HOST, AODT_PORT))
             s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
             data = b""
@@ -49,10 +50,120 @@ def _run(code: str, truncate: int = 50_000) -> str:
         result = response.get("result", "")
         if not result:
             return "Done (no output)."
+        # When AODT-side code returns success but prints an error traceback/message,
+        # append context + logs to keep agent actions grounded in runtime state.
+        if _looks_like_aodt_error_output(result):
+            diag = _collect_aodt_diagnostics(log_lines=80, truncate=30_000)
+            if diag:
+                if len(diag) > 30_000:
+                    diag = diag[:30_000] + "\n... (diagnostics truncated)"
+                result = f"{result}\n\n--- Auto Diagnostics ---\n{diag}"
         if len(result) > truncate:
             result = result[:truncate] + "\n... (output truncated)"
         return result
-    return f"Error: {response.get('message', 'Unknown error')}"
+    err = f"Error: {response.get('message', 'Unknown error')}"
+    diag = _collect_aodt_diagnostics(log_lines=80, truncate=30_000)
+    if diag:
+        if len(diag) > 30_000:
+            diag = diag[:30_000] + "\n... (diagnostics truncated)"
+        return f"{err}\n\n--- Auto Diagnostics ---\n{diag}"
+    return err
+
+
+def _looks_like_aodt_error_output(output: str) -> bool:
+    """Heuristic: detect embedded runtime errors in stdout from successful execute calls."""
+    if not output:
+        return False
+    lowered = output.lower()
+    if "traceback (most recent call last)" in lowered:
+        return True
+    for line in output.splitlines():
+        s = line.strip().lower()
+        if not s:
+            continue
+        if s.startswith("error:") or s.startswith("exception:"):
+            return True
+        if re.search(r"\bfailed\b", s) and "0 failed" not in s:
+            return True
+    return False
+
+
+def _collect_aodt_diagnostics(log_lines: int = 80, truncate: int = 30_000) -> str:
+    """
+    Pull context + recent logs from inside AODT.
+    Used automatically on command failures to reduce blind retries/workarounds.
+    """
+    safe_lines = max(20, min(int(log_lines), 500))
+    code = f"""
+import glob
+import os
+import carb.settings
+import carb.tokens
+import omni.usd
+import omni.timeline
+import omni.kit.usd.layers as layers
+from aodt.common import constants
+from aodt.progress_bar.progress_bar import ProgressModel
+from aodt.common.utils import get_stage_meters_per_unit, get_scale_factor
+
+def _tail(path, n):
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        data = f.readlines()
+    return data[-n:]
+
+settings = carb.settings.get_settings()
+stage = omni.usd.get_context().get_stage()
+tl = omni.timeline.get_timeline_interface()
+pm = ProgressModel.get_model_instance()
+live_syncing = layers.get_layers().get_live_syncing()
+worker_uuid = settings.get(constants.WORKER_UUID_SETTING_PATH) or ""
+db_connected = bool(settings.get(constants.DB_CONNECTED_STATE_PATH))
+
+print("Runtime Context:")
+print(f"  Stage loaded:      {{bool(stage)}}")
+if stage:
+    print(f"  Stage path:        {{stage.GetRootLayer().realPath or stage.GetRootLayer().identifier}}")
+    print(f"  Meters per unit:   {{get_stage_meters_per_unit()}}")
+    print(f"  Asset scale factor:{{get_scale_factor()}}")
+print(f"  Worker attached:   {{bool(worker_uuid)}}")
+if worker_uuid:
+    print(f"  Worker UUID:       {{worker_uuid}}")
+print(f"  DB connected:      {{db_connected}}")
+print(f"  Live session:      {{bool(live_syncing and live_syncing.is_stage_in_live_session())}}")
+print(f"  Sim running:       {{pm.is_sim_running()}}")
+print(f"  Sim paused:        {{pm.is_sim_paused()}}")
+print(f"  Sim progress:      {{pm.get_value_as_string()}}")
+timeline_state = "playing" if tl.is_playing() else ("stopped" if tl.is_stopped() else "paused")
+print(f"  Timeline state:    {{timeline_state}} @ {{tl.get_current_time():.3f}}s")
+
+print()
+print("Recent Logs:")
+kit_log = settings.get("/log/file")
+if kit_log and os.path.isfile(kit_log):
+    print(f"  KIT log: {{kit_log}}")
+    for line in _tail(kit_log, {safe_lines}):
+        print(line.rstrip("\\n"))
+else:
+    print(f"  KIT log not found: {{kit_log!r}}")
+
+print()
+control_dir = carb.tokens.get_tokens_interface().resolve("${{omni_logs}}") + "/Kit/aodt.control"
+control_logs = sorted(glob.glob(os.path.join(control_dir, "control_*.log")), key=os.path.getmtime)
+if control_logs:
+    latest = control_logs[-1]
+    print(f"  AODT control log: {{latest}}")
+    for line in _tail(latest, {safe_lines}):
+        print(line.rstrip("\\n"))
+else:
+    print(f"  AODT control log not found under {{control_dir}}")
+"""
+    response = _send("execute", {"code": code})
+    if response.get("status") != "success":
+        return f"Unable to collect diagnostics: {response.get('message', 'unknown error')}"
+    out = response.get("result", "")
+    if len(out) > truncate:
+        out = out[:truncate] + "\n... (output truncated)"
+    return out
 
 
 # ─── 1. Connectivity ──────────────────────────────────────────────────────────
@@ -695,49 +806,732 @@ except Exception as e:
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 def get_simulation_status() -> str:
     """
-    Returns the current simulation state (playing / paused / stopped)
-    and the current timeline position.
+    Returns simulation status across both:
+    1) AODT worker-driven simulation pipeline, and
+    2) USD timeline state.
     """
     return _run("""
+import carb.settings
 import omni.timeline
+import omni.kit.usd.layers as layers
+from aodt.common import constants
+from aodt.progress_bar.progress_bar import ProgressModel
+
 tl = omni.timeline.get_timeline_interface()
-state = "playing" if tl.is_playing() else ("stopped" if tl.is_stopped() else "paused")
-print(f"State:       {state}")
+timeline_state = "playing" if tl.is_playing() else ("stopped" if tl.is_stopped() else "paused")
+pm = ProgressModel.get_model_instance()
+settings = carb.settings.get_settings()
+worker_uuid = settings.get(constants.WORKER_UUID_SETTING_PATH) or ""
+db_connected = bool(settings.get(constants.DB_CONNECTED_STATE_PATH))
+live_syncing = layers.get_layers().get_live_syncing()
+in_live = bool(live_syncing and live_syncing.is_stage_in_live_session())
+
+print("AODT Worker Simulation:")
+print(f"  Worker attached: {bool(worker_uuid)}")
+if worker_uuid:
+    print(f"  Worker UUID:     {worker_uuid}")
+print(f"  DB connected:    {db_connected}")
+print(f"  In live session: {in_live}")
+print(f"  Running:         {pm.is_sim_running()}")
+print(f"  Paused:          {pm.is_sim_paused()}")
+print(f"  Progress:        {pm.get_value_as_string()}")
+print()
+print("USD Timeline:")
+print(f"  State:       {timeline_state}")
 print(f"Current time: {tl.get_current_time():.3f}s")
 print(f"Time range:   {tl.get_start_time():.3f}s - {tl.get_end_time():.3f}s")
 """)
 
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def validate_control_readiness(require_live_session: bool = True, require_saved_stage: bool = False) -> str:
+    """
+    Returns a preflight checklist for agentic AODT control.
+    Includes readiness booleans for mobility generation and simulation start.
+    """
+    code = f"""
+import json
+import carb.settings
+import omni.usd
+import omni.kit.usd.layers as layers
+from aodt.common import constants
+from aodt.common.prims import get_total_ues
+from aodt.progress_bar.progress_bar import ProgressModel
+from aodt.telemetry import TelemetryExt
+from aodt.toolbar.extension import validate_ref_freq, validate_ru_du_assignment
+
+_require_live = {str(require_live_session)}
+_require_saved = {str(require_saved_stage)}
+
+stage = omni.usd.get_context().get_stage()
+settings = carb.settings.get_settings()
+live_syncing = layers.get_layers().get_live_syncing()
+worker_uuid = settings.get(constants.WORKER_UUID_SETTING_PATH) or ""
+db_connected = bool(settings.get(constants.DB_CONNECTED_STATE_PATH))
+in_live = bool(live_syncing and live_syncing.is_stage_in_live_session())
+pm = ProgressModel.get_model_instance()
+
+stage_loaded = bool(stage)
+stage_path = ""
+stage_saved = False
+has_scenario = False
+ru_count = 0
+du_count = 0
+ue_count = 0
+panel_count = 0
+has_panel = False
+
+if stage:
+    root = stage.GetRootLayer()
+    stage_path = root.realPath or root.identifier or ""
+    stage_saved = bool(root.realPath)
+    has_scenario = stage.GetPrimAtPath("/Scenario").IsValid()
+    ru_parent = stage.GetPrimAtPath("/RUs")
+    du_parent = stage.GetPrimAtPath("/DUs")
+    ue_parent = stage.GetPrimAtPath("/UEs")
+    panel_parent = stage.GetPrimAtPath("/Panels")
+    ru_count = len(ru_parent.GetChildren()) if ru_parent.IsValid() else 0
+    du_count = len(du_parent.GetChildren()) if du_parent.IsValid() else 0
+    ue_count = len(ue_parent.GetChildren()) if ue_parent.IsValid() else 0
+    panels = list(panel_parent.GetChildren()) if panel_parent.IsValid() else []
+    panel_count = len(panels)
+    has_panel = any(p.GetName().startswith("panel_") for p in panels) if panels else False
+
+total_ues = get_total_ues() if stage else 0
+
+try:
+    mobility_in_sync = bool(TelemetryExt.is_ue_mobility_in_sync_with_db())
+except Exception:
+    mobility_in_sync = False
+
+try:
+    validation_errors = sorted(list(validate_ref_freq().union(validate_ru_du_assignment())))
+except Exception as e:
+    validation_errors = [f"validation call failed: {e}"]
+
+start_requirements = {
+    "stage_loaded": stage_loaded,
+    "has_scenario_prim": has_scenario,
+    "worker_attached": bool(worker_uuid),
+    "has_panel": has_panel,
+    "has_ues": total_ues > 0,
+    "mobility_in_sync_with_db": mobility_in_sync,
+    "rf_and_ru_du_validation_passed": len(validation_errors) == 0,
+}
+if _require_live:
+    start_requirements["in_live_session"] = in_live
+if _require_saved:
+    start_requirements["stage_saved"] = stage_saved
+start_ready = all(start_requirements.values())
+
+mobility_requirements = {
+    "stage_loaded": stage_loaded,
+    "worker_attached": bool(worker_uuid),
+    "stage_saved": stage_saved,
+}
+if _require_live:
+    mobility_requirements["in_live_session"] = in_live
+mobility_ready = all(mobility_requirements.values())
+
+recommendations = []
+if not stage_loaded:
+    recommendations.append("Load or create an AODT stage.")
+if stage_loaded and not has_scenario:
+    recommendations.append("Ensure /Scenario prim exists (load a valid AODT scene).")
+if not worker_uuid:
+    recommendations.append("Attach a worker from AODT configuration before mobility/simulation.")
+if _require_live and not in_live:
+    recommendations.append("Create or join a live session before starting simulation.")
+if not has_panel:
+    recommendations.append("Create at least one panel under /Panels (create_panel).")
+if total_ues <= 0:
+    recommendations.append("Create at least one UE (create_ue or create_tx_rx_pair).")
+if not mobility_in_sync:
+    recommendations.append("Run generate_mobility and wait for DB sync.")
+if not stage_saved:
+    recommendations.append("Save the stage before mobility generation.")
+if validation_errors:
+    recommendations.append("Fix RF / RU-DU validation errors listed in validation_errors.")
+
+payload = {
+    "checks": {
+        "stage_loaded": stage_loaded,
+        "stage_path": stage_path,
+        "stage_saved": stage_saved,
+        "worker_attached": bool(worker_uuid),
+        "worker_uuid": worker_uuid,
+        "db_connected": db_connected,
+        "in_live_session": in_live,
+        "sim_running": pm.is_sim_running(),
+        "sim_paused": pm.is_sim_paused(),
+        "sim_progress": pm.get_value_as_string(),
+        "has_scenario_prim": has_scenario,
+        "has_panel": has_panel,
+        "mobility_in_sync_with_db": mobility_in_sync,
+    },
+    "counts": {
+        "rus": ru_count,
+        "dus": du_count,
+        "ues": ue_count,
+        "panels": panel_count,
+        "total_ues": total_ues,
+    },
+    "start_sim_requirements": start_requirements,
+    "start_sim_ready": start_ready,
+    "mobility_requirements": mobility_requirements,
+    "mobility_ready": mobility_ready,
+    "validation_errors": validation_errors,
+    "recommendations": recommendations,
+}
+
+print(json.dumps(payload, indent=2))
+"""
+    return _run(code)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def wait_for_mobility_sync(timeout_seconds: int = 180, poll_interval_seconds: float = 1.0) -> str:
+    """
+    Waits until UE mobility is in sync with DB (TelemetryExt check), or times out.
+    Useful immediately after generate_mobility().
+    """
+    code = f"""
+import json
+import time
+from aodt.telemetry import TelemetryExt
+
+_timeout = max(1, int({timeout_seconds}))
+_poll = max(0.1, float({poll_interval_seconds}))
+start = time.time()
+samples = []
+
+while True:
+    now = time.time()
+    elapsed = now - start
+    try:
+        synced = bool(TelemetryExt.is_ue_mobility_in_sync_with_db())
+    except Exception as e:
+        synced = False
+        samples.append({{"t": round(elapsed, 2), "synced": False, "error": str(e)}})
+    else:
+        samples.append({{"t": round(elapsed, 2), "synced": synced}})
+
+    if synced:
+        print(json.dumps({{
+            "synced": True,
+            "elapsed_seconds": round(elapsed, 2),
+            "samples": samples[-40:],
+        }}, indent=2))
+        break
+
+    if elapsed >= _timeout:
+        print(json.dumps({{
+            "synced": False,
+            "reason": "timeout",
+            "elapsed_seconds": round(elapsed, 2),
+            "samples": samples[-40:],
+        }}, indent=2))
+        break
+
+    time.sleep(_poll)
+"""
+    return _run(code)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def wait_for_sim_completion(
+    timeout_seconds: int = 240,
+    poll_interval_seconds: float = 1.0,
+    fail_if_not_running_initially: bool = True,
+) -> str:
+    """
+    Waits for worker simulation to finish (or timeout) using ProgressModel state.
+    """
+    code = f"""
+import json
+import time
+from aodt.progress_bar.progress_bar import ProgressModel
+
+_timeout = max(1, int({timeout_seconds}))
+_poll = max(0.1, float({poll_interval_seconds}))
+_fail_if_not_running = {str(fail_if_not_running_initially)}
+
+pm = ProgressModel.get_model_instance()
+initial_running = pm.is_sim_running()
+initial_paused = pm.is_sim_paused()
+
+if _fail_if_not_running and not initial_running:
+    print(json.dumps({{
+        "completed": False,
+        "reason": "simulation_not_running_at_start",
+        "sim_running": initial_running,
+        "sim_paused": initial_paused,
+        "progress": pm.get_value_as_string(),
+        "progress_float": round(float(pm.get_value_as_float()), 4),
+    }}, indent=2))
+    raise SystemExit
+
+start = time.time()
+saw_running = initial_running
+history = []
+
+while True:
+    now = time.time()
+    elapsed = now - start
+    running = pm.is_sim_running()
+    paused = pm.is_sim_paused()
+    progress_float = float(pm.get_value_as_float())
+    progress_str = pm.get_value_as_string()
+    state = "running" if running and not paused else ("paused" if paused else "idle")
+
+    if running:
+        saw_running = True
+
+    if (not history) or state != history[-1]["state"] or abs(progress_float - history[-1]["progress_float"]) >= 0.01:
+        history.append({
+            "t": round(elapsed, 2),
+            "state": state,
+            "progress": progress_str,
+            "progress_float": round(progress_float, 4),
+        })
+
+    completed = (saw_running and not running and not paused) or progress_float >= 1.0
+    if completed:
+        print(json.dumps({
+            "completed": True,
+            "elapsed_seconds": round(elapsed, 2),
+            "final_state": state,
+            "progress": progress_str,
+            "progress_float": round(progress_float, 4),
+            "history": history[-40:],
+        }, indent=2))
+        break
+
+    if elapsed >= _timeout:
+        print(json.dumps({
+            "completed": False,
+            "reason": "timeout",
+            "elapsed_seconds": round(elapsed, 2),
+            "state": state,
+            "sim_running": running,
+            "sim_paused": paused,
+            "progress": progress_str,
+            "progress_float": round(progress_float, 4),
+            "history": history[-40:],
+        }, indent=2))
+        break
+
+    time.sleep(_poll)
+"""
+    return _run(code)
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 def start_simulation() -> str:
-    """Starts (plays) the simulation from its current time position."""
+    """
+    Starts AODT worker-driven simulation (equivalent to the toolbar Play flow),
+    including validation checks required by AODT.
+    """
     return _run("""
-import omni.timeline
-tl = omni.timeline.get_timeline_interface()
-tl.play()
-print(f"Simulation started at {tl.get_current_time():.3f}s")
+import carb.settings
+import omni.usd
+import omni.kit.usd.layers as layers
+from pxr import Sdf
+from aodt.common import constants, messages
+from aodt.common.prims import get_total_ues
+from aodt.configuration.worker_manager import get_worker_manager_instance
+from aodt.progress_bar.progress_bar import ProgressModel
+from aodt.telemetry import TelemetryExt
+from aodt.toolbar.extension import validate_ref_freq, validate_ru_du_assignment
+
+settings = carb.settings.get_settings()
+stage = omni.usd.get_context().get_stage()
+if not stage:
+    print("Error: no stage loaded.")
+    raise SystemExit
+if not stage.GetPrimAtPath("/Scenario").IsValid():
+    print("Error: /Scenario prim not found.")
+    raise SystemExit
+
+worker_uuid = settings.get(constants.WORKER_UUID_SETTING_PATH) or ""
+if not worker_uuid:
+    print("Error: worker is not attached. Attach worker from AODT before starting simulation.")
+    raise SystemExit
+
+live_syncing = layers.get_layers().get_live_syncing()
+if not (live_syncing and live_syncing.is_stage_in_live_session()):
+    ok = get_worker_manager_instance().create_or_join_live_session(force_create=True)
+    if not ok:
+        print("Error: failed to create/join live session.")
+        raise SystemExit
+
+panel_parent = stage.GetPrimAtPath("/Panels")
+has_panel = bool(panel_parent and panel_parent.IsValid() and any(
+    p.GetName().startswith("panel_") for p in panel_parent.GetChildren()
+))
+if not has_panel:
+    print("Error: no panel found in /Panels. Create at least one panel first.")
+    raise SystemExit
+
+if not TelemetryExt.is_ue_mobility_in_sync_with_db():
+    print("Error: UE mobility is not in sync with DB. Generate mobility first.")
+    raise SystemExit
+
+total_ues = get_total_ues()
+if not total_ues:
+    print("Error: no UEs found in stage.")
+    raise SystemExit
+
+freq_errors = validate_ref_freq()
+du_errors = validate_ru_du_assignment()
+all_errors = list(freq_errors.union(du_errors))
+if all_errors:
+    print("Error: simulation validation failed:")
+    for e in sorted(all_errors):
+        print(f"  - {e}")
+    raise SystemExit
+
+scenario_prim = stage.GetPrimAtPath("/Scenario")
+scenario_prim.CreateAttribute("sim:num_users", Sdf.ValueTypeNames.UInt, True).Set(total_ues)
+
+pm = ProgressModel.get_model_instance()
+if pm.is_sim_running() and not pm.is_sim_paused():
+    print("Error: simulation is already running.")
+    raise SystemExit
+
+pm.handle_progress(0.0)
+pm.set_sim_paused(False)
+TelemetryExt.update_rays_enabled_ru_ue_pairs(update_raypaths=False)
+get_worker_manager_instance().send_message(messages.StartSimRequest())
+print("StartSimRequest sent to worker.")
 """)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 def stop_simulation() -> str:
-    """Pauses the simulation at its current time position."""
+    """Pauses a worker-driven AODT simulation."""
     return _run("""
-import omni.timeline
-tl = omni.timeline.get_timeline_interface()
-tl.pause()
-print(f"Simulation paused at {tl.get_current_time():.3f}s")
+import carb.settings
+from aodt.common import constants, messages
+from aodt.configuration.worker_manager import get_worker_manager_instance
+from aodt.progress_bar.progress_bar import ProgressModel
+
+settings = carb.settings.get_settings()
+worker_uuid = settings.get(constants.WORKER_UUID_SETTING_PATH) or ""
+if not worker_uuid:
+    print("Error: worker is not attached.")
+else:
+    ProgressModel.get_model_instance().set_sim_paused(True)
+    get_worker_manager_instance().send_message(messages.PauseSimRequest())
+    print("PauseSimRequest sent to worker.")
 """)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
 def reset_simulation() -> str:
-    """Stops the simulation and resets the timeline to t=0."""
+    """Stops worker simulation and resets timeline to t=0."""
     return _run("""
+import carb.settings
 import omni.timeline
+from aodt.common import constants, messages
+from aodt.configuration.worker_manager import get_worker_manager_instance
+from aodt.progress_bar.progress_bar import ProgressModel
+
+settings = carb.settings.get_settings()
+worker_uuid = settings.get(constants.WORKER_UUID_SETTING_PATH) or ""
+if worker_uuid:
+    get_worker_manager_instance().send_message(messages.StopSimRequest())
+    ProgressModel.get_model_instance().set_sim_paused(False)
+    ProgressModel.get_model_instance().handle_progress(-1.0)
+    print("StopSimRequest sent to worker.")
+else:
+    print("Warning: worker not attached; only timeline will be reset.")
 omni.timeline.get_timeline_interface().stop()
-print("Simulation reset to t=0.")
+print("Timeline reset to t=0.")
 """)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+def generate_mobility() -> str:
+    """
+    Triggers AODT mobility generation through the worker pipeline.
+    """
+    return _run("""
+import time
+import carb.settings
+import omni.usd
+from pxr import Sdf
+from aodt.common import constants, messages
+from aodt.common.prims import get_total_ues
+from aodt.configuration.worker_manager import get_worker_manager_instance
+
+settings = carb.settings.get_settings()
+stage = omni.usd.get_context().get_stage()
+if not stage:
+    print("Error: no stage loaded.")
+    raise SystemExit
+worker_uuid = settings.get(constants.WORKER_UUID_SETTING_PATH) or ""
+if not worker_uuid:
+    print("Error: worker is not attached.")
+    raise SystemExit
+scene_url = stage.GetRootLayer().realPath
+if not scene_url:
+    print("Error: current stage must be saved before generating mobility.")
+    raise SystemExit
+
+scenario_prim = stage.GetPrimAtPath("/Scenario")
+if scenario_prim.IsValid():
+    scenario_prim.CreateAttribute("sim:num_users", Sdf.ValueTypeNames.UInt, True).Set(get_total_ues())
+
+wm = get_worker_manager_instance()
+live_session_name = constants.LIVE_SESSION_PREFIX + (settings.get(constants.SESSION_NAME_SETTING_PATH) or "")
+wm.skip_next_db_update = True
+wm.send_message(messages.OpenSceneRequest(scene_url=scene_url, live_session_name=live_session_name))
+time.sleep(0.3)
+wm.send_message(messages.MobilityRequest())
+print("MobilityRequest sent to worker.")
+""")
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def get_aodt_runtime_context() -> str:
+    """
+    Returns a concise readiness/context snapshot for agentic control.
+    """
+    return _run("""
+import json
+import carb.settings
+import omni.kit.usd.layers as layers
+import omni.usd
+from aodt.common import constants
+from aodt.common.utils import get_scale_factor, get_stage_meters_per_unit
+from aodt.progress_bar.progress_bar import ProgressModel
+
+stage = omni.usd.get_context().get_stage()
+settings = carb.settings.get_settings()
+live_syncing = layers.get_layers().get_live_syncing()
+in_live = bool(live_syncing and live_syncing.is_stage_in_live_session())
+worker_uuid = settings.get(constants.WORKER_UUID_SETTING_PATH) or ""
+db_connected = bool(settings.get(constants.DB_CONNECTED_STATE_PATH))
+scenario = stage.GetPrimAtPath("/Scenario") if stage else None
+ru_count = len(stage.GetPrimAtPath("/RUs").GetChildren()) if stage and stage.GetPrimAtPath("/RUs").IsValid() else 0
+du_count = len(stage.GetPrimAtPath("/DUs").GetChildren()) if stage and stage.GetPrimAtPath("/DUs").IsValid() else 0
+ue_count = len(stage.GetPrimAtPath("/UEs").GetChildren()) if stage and stage.GetPrimAtPath("/UEs").IsValid() else 0
+panel_count = len(stage.GetPrimAtPath("/Panels").GetChildren()) if stage and stage.GetPrimAtPath("/Panels").IsValid() else 0
+pm = ProgressModel.get_model_instance()
+
+payload = {
+    "stage_loaded": bool(stage),
+    "stage_path": stage.GetRootLayer().realPath if stage else "",
+    "stage_meters_per_unit": get_stage_meters_per_unit(),
+    "asset_scale_factor": get_scale_factor(),
+    "has_scenario_prim": bool(scenario and scenario.IsValid()),
+    "worker_attached": bool(worker_uuid),
+    "worker_uuid": worker_uuid,
+    "db_connected": db_connected,
+    "in_live_session": in_live,
+    "sim_running": pm.is_sim_running(),
+    "sim_paused": pm.is_sim_paused(),
+    "sim_progress": pm.get_value_as_string(),
+    "counts": {
+        "rus": ru_count,
+        "dus": du_count,
+        "ues": ue_count,
+        "panels": panel_count,
+    },
+}
+print(json.dumps(payload, indent=2))
+""")
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def get_recent_aodt_logs(max_lines: int = 200) -> str:
+    """
+    Returns recent lines from the current Kit log and latest aodt.control log.
+    """
+    code = f"""
+import glob
+import os
+import carb.settings
+import carb.tokens
+
+_max_lines = max(20, min(int({max_lines}), 2000))
+
+def _tail(path, n):
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        data = f.readlines()
+    return data[-n:]
+
+settings = carb.settings.get_settings()
+kit_log = settings.get("/log/file")
+print(f"Requested lines: {{_max_lines}}")
+print()
+
+if kit_log and os.path.isfile(kit_log):
+    print(f"=== KIT LOG: {{kit_log}} ===")
+    for line in _tail(kit_log, _max_lines):
+        print(line.rstrip("\\n"))
+else:
+    print(f"KIT log not found: {{kit_log!r}}")
+
+print()
+control_dir = carb.tokens.get_tokens_interface().resolve("${{omni_logs}}") + "/Kit/aodt.control"
+control_logs = sorted(glob.glob(os.path.join(control_dir, "control_*.log")), key=os.path.getmtime)
+if control_logs:
+    latest = control_logs[-1]
+    print(f"=== AODT CONTROL LOG: {{latest}} ===")
+    for line in _tail(latest, _max_lines):
+        print(line.rstrip("\\n"))
+else:
+    print(f"No aodt.control logs found under {{control_dir}}")
+    """
+    return _run(code)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def stream_aodt_logs(max_new_lines: int = 200, reset_cursor: bool = False) -> str:
+    """
+    Streams only new log lines since the previous call (Kit + latest aodt.control log).
+    Keeps per-log cursors inside AODT Python exec scope for low-noise observability.
+    """
+    code = f"""
+import glob
+import json
+import os
+import carb.settings
+import carb.tokens
+
+_max_lines = max(20, min(int({max_new_lines}), 2000))
+_reset = {str(reset_cursor)}
+
+if "__mcp_log_cursors" not in globals():
+    __mcp_log_cursors = {{}}
+
+def _read_new_lines(path, key, max_lines, reset):
+    if reset:
+        __mcp_log_cursors[key] = 0
+    if key not in __mcp_log_cursors:
+        __mcp_log_cursors[key] = 0
+    cursor = int(__mcp_log_cursors.get(key, 0) or 0)
+    if not os.path.isfile(path):
+        return {{
+            "path": path,
+            "found": False,
+            "new_lines": [],
+            "cursor": 0,
+            "truncated": False,
+        }}
+    size = os.path.getsize(path)
+    if cursor > size:
+        cursor = 0
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        f.seek(cursor)
+        chunk = f.read()
+        cursor = f.tell()
+    __mcp_log_cursors[key] = cursor
+    lines = chunk.splitlines()
+    truncated = False
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+        truncated = True
+    return {{
+        "path": path,
+        "found": True,
+        "new_lines": lines,
+        "cursor": cursor,
+        "truncated": truncated,
+    }}
+
+settings = carb.settings.get_settings()
+kit_log = settings.get("/log/file")
+control_dir = carb.tokens.get_tokens_interface().resolve("${{omni_logs}}") + "/Kit/aodt.control"
+control_logs = sorted(glob.glob(os.path.join(control_dir, "control_*.log")), key=os.path.getmtime)
+control_log = control_logs[-1] if control_logs else ""
+
+payload = {{
+    "cursor_reset": _reset,
+    "max_new_lines": _max_lines,
+    "kit": _read_new_lines(kit_log, "kit_log", _max_lines, _reset) if kit_log else {{"found": False, "path": "", "new_lines": [], "cursor": 0, "truncated": False}},
+    "control": _read_new_lines(control_log, "control_log", _max_lines, _reset) if control_log else {{"found": False, "path": control_log, "new_lines": [], "cursor": 0, "truncated": False}},
+}}
+
+print(json.dumps(payload, indent=2))
+"""
+    return _run(code)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+def refresh_raypaths(read_db: bool = True) -> str:
+    """
+    Refreshes ray path visualization from telemetry settings/database.
+    """
+    code = f"""
+from aodt.telemetry import TelemetryExt
+TelemetryExt.update_rays_enabled_ru_ue_pairs(update_raypaths=False)
+TelemetryExt.update_raypaths(read_db={str(read_db)})
+pairs = TelemetryExt.get_rays_enabled_ru_ue_pairs()
+print(f"Raypath refresh requested (read_db={read_db}). Enabled RU-UE pairs: {{len(pairs)}}")
+for ru_id, ue_id in pairs[:30]:
+    print(f"  RU {{ru_id}} -> UE {{ue_id}}")
+if len(pairs) > 30:
+    print(f"  ... and {{len(pairs)-30}} more pairs")
+"""
+    return _run(code)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+def set_ray_pair_enabled(ru_prim_path: str, ue_prim_path: str, enabled: bool = True) -> str:
+    """
+    Enables/disables ray tracing visibility for a specific RU-UE pair.
+    """
+    code = f"""
+import re
+import omni.usd
+from pxr import Sdf, Vt
+from aodt.telemetry import TelemetryExt
+
+_ru_path = {json.dumps(ru_prim_path)}
+_ue_path = {json.dumps(ue_prim_path)}
+_enabled = {str(enabled)}
+stage = omni.usd.get_context().get_stage()
+ru = stage.GetPrimAtPath(_ru_path)
+ue = stage.GetPrimAtPath(_ue_path)
+if not ru.IsValid():
+    print(f"Error: invalid RU path {{_ru_path}}")
+    raise SystemExit
+if not ue.IsValid():
+    print(f"Error: invalid UE path {{_ue_path}}")
+    raise SystemExit
+
+rm = re.search(r"ru_(\\d+)", _ru_path)
+if not rm:
+    print(f"Error: unable to infer RU id from {{_ru_path}}")
+    raise SystemExit
+ru_id = int(rm.group(1))
+
+if not ru.HasAttribute("aerial:gnb:enable_rays"):
+    ru.CreateAttribute("aerial:gnb:enable_rays", Sdf.ValueTypeNames.Bool, True)
+ru.GetAttribute("aerial:gnb:enable_rays").Set(True if _enabled else False)
+
+if ue.HasAttribute("aerial:ue:rays_enabled_ru_ids"):
+    ids = ue.GetAttribute("aerial:ue:rays_enabled_ru_ids").Get()
+    ids = [] if ids is None else list(ids)
+else:
+    ue.CreateAttribute("aerial:ue:rays_enabled_ru_ids", Sdf.ValueTypeNames.IntArray, True)
+    ids = []
+
+if _enabled and ru_id not in ids:
+    ids.append(ru_id)
+if (not _enabled) and ru_id in ids:
+    ids.remove(ru_id)
+ids = sorted(set(ids))
+ue.GetAttribute("aerial:ue:rays_enabled_ru_ids").Set(Vt.IntArray(ids))
+
+pairs = TelemetryExt.update_rays_enabled_ru_ue_pairs(update_raypaths=False) or []
+print(f"Pair {{'enabled' if _enabled else 'disabled'}}: RU {{ru_id}} <-> {{_ue_path}}")
+print(f"Current enabled pair count: {{len(pairs)}}")
+"""
+    return _run(code)
 
 
 # ─── 9. AODT domain — network entities ───────────────────────────────────────
@@ -801,62 +1595,403 @@ list_entity_group("/UEs", "UE")
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
-def create_ue(position: list[float]) -> str:
+def create_panel() -> str:
+    """
+    Creates a new panel prim under /Panels with the next available ID.
+    """
+    return _run("""
+from aodt.common.prims import create_panel_prim
+path = create_panel_prim()
+print(f"Panel created at {path}")
+""")
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def list_panels() -> str:
+    """
+    Lists all panel prims and key RF attributes.
+    """
+    return _run("""
+import omni.usd
+stage = omni.usd.get_context().get_stage()
+parent = stage.GetPrimAtPath("/Panels")
+if not parent.IsValid():
+    print("No /Panels prim found.")
+else:
+    panels = list(parent.GetChildren())
+    print(f"Panels ({len(panels)}):")
+    for p in panels:
+        attrs = {}
+        for name in (
+            "aerial:panel:reference_freq",
+            "aerial:panel:num_horizontal_elements",
+            "aerial:panel:num_vertical_elements",
+            "aerial:panel:dual_polarized",
+        ):
+            a = p.GetAttribute(name)
+            attrs[name] = a.Get() if a and a.IsValid() else None
+        print(f"  {p.GetPath()}: {attrs}")
+""")
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+def set_default_panels(ru_panel_name: str = "", ue_panel_name: str = "") -> str:
+    """
+    Sets default panel assignments on /Scenario (sim:gnb:panel_type, sim:ue:panel_type).
+    """
+    code = f"""
+import omni.usd
+from pxr import Sdf
+_ru = {json.dumps(ru_panel_name)}
+_ue = {json.dumps(ue_panel_name)}
+stage = omni.usd.get_context().get_stage()
+scenario = stage.GetPrimAtPath("/Scenario")
+if not scenario.IsValid():
+    print("Error: /Scenario prim not found.")
+    raise SystemExit
+
+if _ru:
+    if not scenario.HasAttribute("sim:gnb:panel_type"):
+        scenario.CreateAttribute("sim:gnb:panel_type", Sdf.ValueTypeNames.String, True)
+    scenario.GetAttribute("sim:gnb:panel_type").Set(_ru)
+    print(f"Set sim:gnb:panel_type = {{_ru!r}}")
+if _ue:
+    if not scenario.HasAttribute("sim:ue:panel_type"):
+        scenario.CreateAttribute("sim:ue:panel_type", Sdf.ValueTypeNames.String, True)
+    scenario.GetAttribute("sim:ue:panel_type").Set(_ue)
+    print(f"Set sim:ue:panel_type = {{_ue!r}}")
+if (not _ru) and (not _ue):
+    print("No panel values provided.")
+"""
+    return _run(code)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+def create_ue(position: list[float], position_units: str = "stage") -> str:
     """
     Places a new User Equipment (UE / mobile device) in the AODT scene.
-    Uses the AODT prim factory for correct asset referencing and ID assignment.
 
     Args:
-        position: [x, y, z] world coordinates in stage units (e.g. [100.0, 200.0, 0.0]).
+        position: [x, y, z] world coordinates.
+        position_units: 'stage' (default), 'meters', or 'centimeters'.
     """
     code = f"""
-from pxr import Gf
-from aodt.common.prims import create_ue_prim
-_pos = {json.dumps(position)}
-prim = create_ue_prim(position=Gf.Vec3d(*_pos))
-if prim and prim.IsValid():
-    print(f"UE created at {{prim.GetPath()}}  position={{_pos}}")
+import re, omni.usd, carb
+from pxr import Sdf, UsdGeom, Gf
+from aodt.common.constants import UE_ASSET_SETTING_PATH
+from aodt.common.prims import get_stage_next_free_path
+from aodt.common.utils import get_scale_factor, get_stage_meters_per_unit
+
+_pos_in = {json.dumps(position)}
+_units = {json.dumps(position_units)}.lower()
+stage = omni.usd.get_context().get_stage()
+stage_units = get_stage_meters_per_unit()
+
+if _units in ("meter", "meters", "m"):
+    unit_scale = 1.0 / stage_units
+elif _units in ("centimeter", "centimeters", "cm"):
+    unit_scale = 0.01 / stage_units
+elif _units in ("stage", "unit", "units"):
+    unit_scale = 1.0
 else:
-    print("Error: UE prim was not created. Check that an AODT scene is loaded and UE asset is configured.")
+    print(f"Error: unsupported position_units '{{_units}}'. Use 'stage', 'meters', or 'centimeters'.")
+    raise SystemExit
+_pos = [float(v) * unit_scale for v in _pos_in]
+
+path = get_stage_next_free_path(stage, "/UEs/ue", False)
+prim = stage.DefinePrim(path)
+
+m = re.search(r'/UEs/ue_(\\d+)', path)
+ue_id = int(m.group(1)) if m else 1
+prim.CreateAttribute("aerial:ue:user_id",       Sdf.ValueTypeNames.Int).Set(ue_id)
+prim.CreateAttribute("aerial:ue:manual",         Sdf.ValueTypeNames.Bool).Set(True)
+prim.CreateAttribute("aerial:ue:radiated_power", Sdf.ValueTypeNames.Float).Set(0.001)
+prim.CreateAttribute("aerial:ue:mech_tilt",      Sdf.ValueTypeNames.Float).Set(0.0)
+prim.CreateAttribute("aerial:ue:panel_type",     Sdf.ValueTypeNames.String)
+
+# Inherit height / radius / panel_type from /Scenario if present
+ue_height_m = 1.5
+ue_radius_m = 0.5
+scenario = stage.GetPrimAtPath("/Scenario")
+if scenario.IsValid():
+    if scenario.HasAttribute("sim:ue:height"):
+        ue_height_m = scenario.GetAttribute("sim:ue:height").Get()
+    if scenario.HasAttribute("sim:ue:radius"):
+        ue_radius_m = scenario.GetAttribute("sim:ue:radius").Get()
+    if scenario.HasAttribute("sim:ue:panel_type"):
+        prim.GetAttribute("aerial:ue:panel_type").Set(
+            scenario.GetAttribute("sim:ue:panel_type").Get())
+
+# Z offset so UE base sits at the given z (mirrors create_ue_prim offset logic)
+offset = (ue_height_m / 2 + ue_radius_m) / stage_units
+UsdGeom.Xformable(prim).AddTranslateOp().Set(Gf.Vec3d(_pos[0], _pos[1], _pos[2] + offset))
+scale_attr = prim.GetAttribute("xformOp:scale")
+if scale_attr and scale_attr.Get() is not None:
+    scale_attr.Set(scale_attr.Get() * get_scale_factor())
+
+# AddReference LAST — no attribute reads or viewport selection after this call.
+# Placing it last keeps the Nucleus fetch async and avoids stalling the update stream.
+ue_asset = carb.settings.get_settings().get(UE_ASSET_SETTING_PATH)
+if ue_asset:
+    prim.GetReferences().AddReference(ue_asset)
+else:
+    prim.SetTypeName("Capsule")  # fallback visual if no asset configured
+
+print(f"UE created at {{path}}  input_position={{_pos_in}}  stage_position={{_pos}} units={{_units}}")
 """
     return _run(code)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
-def create_ru(position: list[float]) -> str:
+def create_ru(position: list[float], position_units: str = "stage") -> str:
     """
     Places a new Radio Unit (RU / base station antenna) in the AODT scene.
-    Uses the AODT deployer model for correct placement and configuration.
 
     Args:
-        position: [x, y, z] world coordinates in stage units (e.g. [0.0, 0.0, 30.0]).
+        position: [x, y, z] world coordinates.
+        position_units: 'stage' (default), 'meters', or 'centimeters'.
     """
     code = f"""
+import re, omni.usd, carb
+from pxr import Sdf, UsdGeom, Gf
+from aodt.common.constants import RU_ASSET_SETTING_PATH
+from aodt.common.prims import get_stage_next_free_path
+from aodt.common.utils import get_scale_factor, get_stage_meters_per_unit
 from aodt.deployer.model import get_ru_model_instance
-_pos = {json.dumps(position)}
-prim_path = get_ru_model_instance().deploy_ru(_pos)
-if prim_path:
-    print(f"RU created at {{prim_path}}  position={{_pos}}")
+
+_pos_in = {json.dumps(position)}
+_units = {json.dumps(position_units)}.lower()
+stage = omni.usd.get_context().get_stage()
+stage_units = get_stage_meters_per_unit()
+
+if _units in ("meter", "meters", "m"):
+    unit_scale = 1.0 / stage_units
+elif _units in ("centimeter", "centimeters", "cm"):
+    unit_scale = 0.01 / stage_units
+elif _units in ("stage", "unit", "units"):
+    unit_scale = 1.0
 else:
-    print("Error: RU not created. Check that an AODT scene is loaded and RU asset is configured.")
+    print(f"Error: unsupported position_units '{{_units}}'. Use 'stage', 'meters', or 'centimeters'.")
+    raise SystemExit
+_pos = [float(v) * unit_scale for v in _pos_in]
+
+path = get_stage_next_free_path(stage, "/RUs/ru", False)
+prim = stage.DefinePrim(path)
+
+m = re.search(r'/RUs/ru_(\\d+)', path)
+cell_id = int(m.group(1)) if m else 1
+prim.CreateAttribute("aerial:gnb:cell_id",      Sdf.ValueTypeNames.Int).Set(cell_id)
+prim.CreateAttribute("aerial:gnb:mech_azimuth", Sdf.ValueTypeNames.Float).Set(0.0)
+prim.CreateAttribute("aerial:gnb:height",       Sdf.ValueTypeNames.Float).Set(0.5)
+prim.CreateAttribute("aerial:gnb:panel_type",   Sdf.ValueTypeNames.String)
+
+# Inherit panel_type from /Scenario if present
+scenario = stage.GetPrimAtPath("/Scenario")
+if scenario.IsValid() and scenario.HasAttribute("sim:gnb:panel_type"):
+    prim.GetAttribute("aerial:gnb:panel_type").Set(
+        scenario.GetAttribute("sim:gnb:panel_type").Get())
+
+ru_h_m = prim.GetAttribute("aerial:gnb:height").Get() if prim.HasAttribute("aerial:gnb:height") else 0.0
+ru_z = _pos[2] + (ru_h_m / stage_units) / 2.0
+UsdGeom.Xformable(prim).AddTranslateOp().Set(Gf.Vec3d(_pos[0], _pos[1], ru_z))
+scale_attr = prim.GetAttribute("xformOp:scale")
+if scale_attr and scale_attr.Get() is not None:
+    scale_attr.Set(scale_attr.Get() * get_scale_factor())
+
+# DU assignment (reads Panel for num_antennas/reference_freq; silent no-op if no Panel)
+try:
+    get_ru_model_instance().assign_ru_to_du(prim)
+except Exception:
+    pass
+
+# AddReference LAST — no attribute reads or viewport selection after this call.
+# Placing it last keeps the Nucleus fetch async and avoids stalling the update stream.
+ru_asset = carb.settings.get_settings().get(RU_ASSET_SETTING_PATH)
+if ru_asset:
+    prim.GetReferences().AddReference(ru_asset)
+
+print(f"RU created at {{path}}  input_position={{_pos_in}}  stage_position={{_pos}} units={{_units}}")
 """
     return _run(code)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
-def create_du(position: list[float]) -> str:
+def create_du(position: list[float], position_units: str = "stage") -> str:
     """
     Places a new Distributed Unit (DU / baseband processing unit) in the AODT scene.
-    DUs are typically placed above buildings (min ~300 m altitude) and connect to RUs.
+    DUs connect to RUs and carry the baseband configuration (num_antennas, reference_freq).
 
     Args:
-        position: [x, y, z] world coordinates in stage units (e.g. [0.0, 0.0, 350.0]).
+        position: [x, y, z] world coordinates.
+        position_units: 'stage' (default), 'meters', or 'centimeters'.
     """
     code = f"""
-from aodt.deployer.model import get_du_model_instance
-_pos = {json.dumps(position)}
-get_du_model_instance().deploy_du(_pos)
-print(f"DU deployment triggered at position {{_pos}}")
+import re, omni.usd, carb
+from pxr import Sdf, UsdGeom, Gf
+from aodt.common.constants import DU_ASSET_SETTING_PATH
+from aodt.common.prims import get_stage_next_free_path
+from aodt.common.utils import get_scale_factor, get_stage_meters_per_unit
+from aodt.deployer.model import DU_TO_BUILDING_METERS, MIN_DU_Z_METERS, get_ru_model_instance
+
+_pos_in = {json.dumps(position)}
+_units = {json.dumps(position_units)}.lower()
+stage = omni.usd.get_context().get_stage()
+stage_units = get_stage_meters_per_unit()
+
+if _units in ("meter", "meters", "m"):
+    unit_scale = 1.0 / stage_units
+elif _units in ("centimeter", "centimeters", "cm"):
+    unit_scale = 0.01 / stage_units
+elif _units in ("stage", "unit", "units"):
+    unit_scale = 1.0
+else:
+    print(f"Error: unsupported position_units '{{_units}}'. Use 'stage', 'meters', or 'centimeters'.")
+    raise SystemExit
+_pos = [float(v) * unit_scale for v in _pos_in]
+
+path = get_stage_next_free_path(stage, "/DUs/du", False)
+prim = stage.DefinePrim(path)
+
+m = re.search(r'/DUs/du_(\\d+)', path)
+du_id = int(m.group(1)) if m else 1
+prim.CreateAttribute("aerial:du:id",             Sdf.ValueTypeNames.Int).Set(du_id)
+prim.CreateAttribute("aerial:du:num_antennas",   Sdf.ValueTypeNames.Int)
+prim.CreateAttribute("aerial:du:reference_freq", Sdf.ValueTypeNames.Double)
+
+du_z = max(_pos[2] + DU_TO_BUILDING_METERS / 2.0 / stage_units, MIN_DU_Z_METERS / 2.0 / stage_units)
+UsdGeom.Xformable(prim).AddTranslateOp().Set(Gf.Vec3d(_pos[0], _pos[1], du_z))
+scale_attr = prim.GetAttribute("xformOp:scale")
+if scale_attr and scale_attr.Get() is not None:
+    scale_attr.Set(scale_attr.Get() * get_scale_factor())
+
+# Re-evaluate RU->DU assignments now that a new DU exists
+try:
+    get_ru_model_instance().refresh_ru_du_associations()
+except Exception:
+    pass
+
+# AddReference LAST — same reasoning as create_ru / create_ue.
+du_asset = carb.settings.get_settings().get(DU_ASSET_SETTING_PATH)
+if du_asset:
+    prim.GetReferences().AddReference(du_asset)
+
+print(f"DU created at {{path}}  input_position={{_pos_in}}  stage_position={{_pos}} units={{_units}}")
+"""
+    return _run(code)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+def create_tx_rx_pair(
+    tx_position: list[float],
+    rx_position: list[float],
+    position_units: str = "meters",
+    enable_rays: bool = True,
+) -> str:
+    """
+    Creates a basic TX/RX pair for AODT:
+    - TX: RU at tx_position
+    - RX: UE at rx_position
+    Optionally enables ray-path visibility for that pair.
+    """
+    code = f"""
+import re, omni.usd, carb
+from pxr import Sdf, UsdGeom, Gf, Vt
+from aodt.common.constants import RU_ASSET_SETTING_PATH, UE_ASSET_SETTING_PATH
+from aodt.common.prims import get_stage_next_free_path
+from aodt.common.utils import get_scale_factor, get_stage_meters_per_unit
+from aodt.deployer.model import get_ru_model_instance
+from aodt.telemetry import TelemetryExt
+
+_tx_in = {json.dumps(tx_position)}
+_rx_in = {json.dumps(rx_position)}
+_units = {json.dumps(position_units)}.lower()
+_enable_rays = {str(enable_rays)}
+stage = omni.usd.get_context().get_stage()
+if not stage:
+    print("Error: no stage loaded.")
+    raise SystemExit
+stage_units = get_stage_meters_per_unit()
+if _units in ("meter", "meters", "m"):
+    unit_scale = 1.0 / stage_units
+elif _units in ("centimeter", "centimeters", "cm"):
+    unit_scale = 0.01 / stage_units
+elif _units in ("stage", "unit", "units"):
+    unit_scale = 1.0
+else:
+    print(f"Error: unsupported position_units '{{_units}}'")
+    raise SystemExit
+_tx = [float(v) * unit_scale for v in _tx_in]
+_rx = [float(v) * unit_scale for v in _rx_in]
+
+# --- Create RU (TX)
+ru_path = get_stage_next_free_path(stage, "/RUs/ru", False)
+ru = stage.DefinePrim(ru_path)
+m = re.search(r'/RUs/ru_(\\d+)', ru_path)
+ru_id = int(m.group(1)) if m else 1
+ru.CreateAttribute("aerial:gnb:cell_id", Sdf.ValueTypeNames.Int).Set(ru_id)
+ru.CreateAttribute("aerial:gnb:mech_azimuth", Sdf.ValueTypeNames.Float).Set(0.0)
+ru.CreateAttribute("aerial:gnb:height", Sdf.ValueTypeNames.Float).Set(0.5)
+ru.CreateAttribute("aerial:gnb:panel_type", Sdf.ValueTypeNames.String)
+if not ru.HasAttribute("aerial:gnb:enable_rays"):
+    ru.CreateAttribute("aerial:gnb:enable_rays", Sdf.ValueTypeNames.Bool, True)
+ru.GetAttribute("aerial:gnb:enable_rays").Set(True if _enable_rays else False)
+scenario = stage.GetPrimAtPath("/Scenario")
+if scenario.IsValid() and scenario.HasAttribute("sim:gnb:panel_type"):
+    ru.GetAttribute("aerial:gnb:panel_type").Set(scenario.GetAttribute("sim:gnb:panel_type").Get())
+ru_h_m = ru.GetAttribute("aerial:gnb:height").Get() if ru.HasAttribute("aerial:gnb:height") else 0.0
+ru_z = _tx[2] + (ru_h_m / stage_units) / 2.0
+UsdGeom.Xformable(ru).AddTranslateOp().Set(Gf.Vec3d(_tx[0], _tx[1], ru_z))
+if ru.GetAttribute("xformOp:scale") and ru.GetAttribute("xformOp:scale").Get() is not None:
+    ru.GetAttribute("xformOp:scale").Set(ru.GetAttribute("xformOp:scale").Get() * get_scale_factor())
+try:
+    get_ru_model_instance().assign_ru_to_du(ru)
+except Exception:
+    pass
+ru_asset = carb.settings.get_settings().get(RU_ASSET_SETTING_PATH)
+if ru_asset:
+    ru.GetReferences().AddReference(ru_asset)
+
+# --- Create UE (RX)
+ue_path = get_stage_next_free_path(stage, "/UEs/ue", False)
+ue = stage.DefinePrim(ue_path)
+m = re.search(r'/UEs/ue_(\\d+)', ue_path)
+ue_id = int(m.group(1)) if m else 1
+ue.CreateAttribute("aerial:ue:user_id", Sdf.ValueTypeNames.Int).Set(ue_id)
+ue.CreateAttribute("aerial:ue:manual", Sdf.ValueTypeNames.Bool).Set(True)
+ue.CreateAttribute("aerial:ue:radiated_power", Sdf.ValueTypeNames.Float).Set(0.001)
+ue.CreateAttribute("aerial:ue:mech_tilt", Sdf.ValueTypeNames.Float).Set(0.0)
+ue.CreateAttribute("aerial:ue:panel_type", Sdf.ValueTypeNames.String)
+ue_h_m = 1.5
+ue_r_m = 0.5
+if scenario.IsValid():
+    if scenario.HasAttribute("sim:ue:height"):
+        ue_h_m = scenario.GetAttribute("sim:ue:height").Get()
+    if scenario.HasAttribute("sim:ue:radius"):
+        ue_r_m = scenario.GetAttribute("sim:ue:radius").Get()
+    if scenario.HasAttribute("sim:ue:panel_type"):
+        ue.GetAttribute("aerial:ue:panel_type").Set(scenario.GetAttribute("sim:ue:panel_type").Get())
+ue_off = (ue_h_m / 2 + ue_r_m) / stage_units
+UsdGeom.Xformable(ue).AddTranslateOp().Set(Gf.Vec3d(_rx[0], _rx[1], _rx[2] + ue_off))
+if ue.GetAttribute("xformOp:scale") and ue.GetAttribute("xformOp:scale").Get() is not None:
+    ue.GetAttribute("xformOp:scale").Set(ue.GetAttribute("xformOp:scale").Get() * get_scale_factor())
+ue_asset = carb.settings.get_settings().get(UE_ASSET_SETTING_PATH)
+if ue_asset:
+    ue.GetReferences().AddReference(ue_asset)
+
+# Enable rays for the pair if requested.
+if _enable_rays:
+    if ue.HasAttribute("aerial:ue:rays_enabled_ru_ids"):
+        ids = ue.GetAttribute("aerial:ue:rays_enabled_ru_ids").Get()
+        ids = [] if ids is None else list(ids)
+    else:
+        ue.CreateAttribute("aerial:ue:rays_enabled_ru_ids", Sdf.ValueTypeNames.IntArray, True)
+        ids = []
+    if ru_id not in ids:
+        ids.append(ru_id)
+    ue.GetAttribute("aerial:ue:rays_enabled_ru_ids").Set(Vt.IntArray(sorted(set(ids))))
+    TelemetryExt.update_rays_enabled_ru_ue_pairs(update_raypaths=False)
+
+print(f"TX RU: {{ru_path}}  RX UE: {{ue_path}}  units={{_units}}  rays_enabled={{_enable_rays}}")
 """
     return _run(code)
 
@@ -1020,9 +2155,10 @@ import omni.client
 
 _query = {safe_query}
 
+home = os.path.expanduser("~")
 search_paths = [
-    "/home/sal-garfield/.local/share/ov/pkg/aodt-1.4.1/assets",
-    "/home/sal-garfield/aodt_1.4.1/assets",
+    f"{home}/.local/share/ov/pkg/aodt-1.4.1/assets",
+    f"{home}/aodt_1.4.1/assets",
     "omniverse://omniverse-server/Users/aerial",
     "omniverse://omniverse-server/Projects",
     "omniverse://omniverse-server/NVIDIA/Assets/DigitalTwin",
@@ -1077,9 +2213,10 @@ def list_loadable_scenes() -> str:
     return _run("""
 import os, omni.client
 
+home = os.path.expanduser("~")
 search_paths = [
-    "/home/sal-garfield/.local/share/ov/pkg/aodt-1.4.1/assets",
-    "/home/sal-garfield/aodt_1.4.1/assets",
+    f"{home}/.local/share/ov/pkg/aodt-1.4.1/assets",
+    f"{home}/aodt_1.4.1/assets",
     "omniverse://omniverse-server/Users/aerial",
     "omniverse://omniverse-server/Projects",
     "omniverse://omniverse-server/NVIDIA/Assets/DigitalTwin",
@@ -1116,7 +2253,456 @@ else:
 """)
 
 
-# ─── 13. Raw execution ────────────────────────────────────────────────────────
+# ─── 13. Guarded Workflow Layer ───────────────────────────────────────────────
+
+def _try_parse_json(text: str):
+    if text is None:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(s):
+        if ch not in "{[":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(s[idx:])
+            return obj
+        except Exception:
+            continue
+    return None
+
+
+def _operation_failed(output: str) -> bool:
+    if output is None:
+        return True
+    text = str(output)
+    if text.strip().startswith("Error:"):
+        return True
+    if text.strip().startswith("Execution failed:"):
+        return True
+    return _looks_like_aodt_error_output(text)
+
+
+def _run_readiness_snapshot() -> tuple[dict, str]:
+    raw = validate_control_readiness(require_live_session=False, require_saved_stage=False)
+    parsed = _try_parse_json(raw)
+    if isinstance(parsed, dict):
+        return parsed, raw
+    return {}, raw
+
+
+def _get_guarded_operation_registry() -> dict:
+    return {
+        "new_stage": new_stage,
+        "load_stage": load_stage,
+        "save_stage": save_stage,
+        "create_panel": create_panel,
+        "list_panels": list_panels,
+        "set_default_panels": set_default_panels,
+        "create_ue": create_ue,
+        "create_ru": create_ru,
+        "create_du": create_du,
+        "create_tx_rx_pair": create_tx_rx_pair,
+        "set_ray_pair_enabled": set_ray_pair_enabled,
+        "refresh_raypaths": refresh_raypaths,
+        "get_simulation_status": get_simulation_status,
+        "start_simulation": start_simulation,
+        "stop_simulation": stop_simulation,
+        "reset_simulation": reset_simulation,
+        "generate_mobility": generate_mobility,
+        "wait_for_mobility_sync": wait_for_mobility_sync,
+        "wait_for_sim_completion": wait_for_sim_completion,
+        "get_aodt_runtime_context": get_aodt_runtime_context,
+        "get_recent_aodt_logs": get_recent_aodt_logs,
+        "stream_aodt_logs": stream_aodt_logs,
+        "validate_control_readiness": validate_control_readiness,
+    }
+
+
+def _execute_guarded_operation_internal(operation: str, args: dict, auto_fix: bool = True) -> dict:
+    operation = (operation or "").strip().lower()
+    args = args or {}
+    registry = _get_guarded_operation_registry()
+    if operation not in registry:
+        return {
+            "success": False,
+            "operation": operation,
+            "error": f"Unsupported guarded operation '{operation}'.",
+            "supported_operations": sorted(registry.keys()),
+        }
+
+    stage_required = {
+        "save_stage",
+        "create_panel",
+        "list_panels",
+        "set_default_panels",
+        "create_ue",
+        "create_ru",
+        "create_du",
+        "create_tx_rx_pair",
+        "set_ray_pair_enabled",
+        "refresh_raypaths",
+        "generate_mobility",
+        "start_simulation",
+        "stop_simulation",
+        "reset_simulation",
+        "get_simulation_status",
+        "validate_control_readiness",
+    }
+    worker_required = {"generate_mobility", "start_simulation"}
+    stage_saved_required = {"generate_mobility"}
+    scenario_required = {"start_simulation"}
+    panel_required = {"start_simulation"}
+    ues_required = {"start_simulation"}
+    mobility_sync_required = {"start_simulation"}
+
+    pre_actions = []
+
+    def _record_pre_action(name: str, ok: bool, output: str):
+        pre_actions.append({"action": name, "success": bool(ok), "output": output})
+
+    readiness, readiness_raw = _run_readiness_snapshot()
+    checks = readiness.get("checks", {}) if isinstance(readiness, dict) else {}
+    counts = readiness.get("counts", {}) if isinstance(readiness, dict) else {}
+    stage_loaded = bool(checks.get("stage_loaded", False))
+    stage_saved = bool(checks.get("stage_saved", False))
+    worker_attached = bool(checks.get("worker_attached", False))
+    has_scenario = bool(checks.get("has_scenario_prim", False))
+    has_panel = bool(checks.get("has_panel", False))
+    mobility_in_sync = bool(checks.get("mobility_in_sync_with_db", False))
+    total_ues = int(counts.get("total_ues", 0) or 0)
+
+    if operation in stage_required and not stage_loaded:
+        if auto_fix and operation in {"create_panel", "create_ue", "create_ru", "create_du", "create_tx_rx_pair"}:
+            out = new_stage()
+            ok = not _operation_failed(out)
+            _record_pre_action("new_stage", ok, out)
+            if not ok:
+                return {
+                    "success": False,
+                    "operation": operation,
+                    "error": "Failed to create stage automatically.",
+                    "pre_actions": pre_actions,
+                    "readiness": readiness or {"raw": readiness_raw},
+                }
+            readiness, readiness_raw = _run_readiness_snapshot()
+            checks = readiness.get("checks", {}) if isinstance(readiness, dict) else {}
+            counts = readiness.get("counts", {}) if isinstance(readiness, dict) else {}
+            stage_loaded = bool(checks.get("stage_loaded", False))
+            stage_saved = bool(checks.get("stage_saved", False))
+            worker_attached = bool(checks.get("worker_attached", False))
+            has_scenario = bool(checks.get("has_scenario_prim", False))
+            has_panel = bool(checks.get("has_panel", False))
+            mobility_in_sync = bool(checks.get("mobility_in_sync_with_db", False))
+            total_ues = int(counts.get("total_ues", 0) or 0)
+        else:
+            return {
+                "success": False,
+                "operation": operation,
+                "error": "Stage is required but not loaded.",
+                "pre_actions": pre_actions,
+                "readiness": readiness or {"raw": readiness_raw},
+            }
+
+    if operation in worker_required and not worker_attached:
+        return {
+            "success": False,
+            "operation": operation,
+            "error": "Worker is not attached. Attach worker in AODT before this operation.",
+            "pre_actions": pre_actions,
+            "readiness": readiness or {"raw": readiness_raw},
+        }
+
+    if operation in scenario_required and not has_scenario:
+        return {
+            "success": False,
+            "operation": operation,
+            "error": "/Scenario prim is missing. Load a valid AODT scene before starting simulation.",
+            "pre_actions": pre_actions,
+            "readiness": readiness or {"raw": readiness_raw},
+        }
+
+    if operation in panel_required and not has_panel and auto_fix:
+        out = create_panel()
+        ok = not _operation_failed(out)
+        _record_pre_action("create_panel", ok, out)
+        readiness, readiness_raw = _run_readiness_snapshot()
+        checks = readiness.get("checks", {}) if isinstance(readiness, dict) else {}
+        has_panel = bool(checks.get("has_panel", False))
+        if (not ok) or (not has_panel):
+            return {
+                "success": False,
+                "operation": operation,
+                "error": "Panel precondition failed. Could not auto-create panel.",
+                "pre_actions": pre_actions,
+                "readiness": readiness or {"raw": readiness_raw},
+            }
+
+    if operation in panel_required and not has_panel:
+        return {
+            "success": False,
+            "operation": operation,
+            "error": "No panel found. Create panel(s) before starting simulation.",
+            "pre_actions": pre_actions,
+            "readiness": readiness or {"raw": readiness_raw},
+        }
+
+    if operation in ues_required and total_ues <= 0:
+        return {
+            "success": False,
+            "operation": operation,
+            "error": "No UEs found. Create UE(s) before starting simulation.",
+            "pre_actions": pre_actions,
+            "readiness": readiness or {"raw": readiness_raw},
+        }
+
+    if operation in stage_saved_required and not stage_saved and auto_fix:
+        out = save_stage()
+        ok = not _operation_failed(out)
+        _record_pre_action("save_stage", ok, out)
+        readiness, readiness_raw = _run_readiness_snapshot()
+        checks = readiness.get("checks", {}) if isinstance(readiness, dict) else {}
+        stage_saved = bool(checks.get("stage_saved", False))
+        if (not ok) or (not stage_saved):
+            return {
+                "success": False,
+                "operation": operation,
+                "error": "Stage must be saved before mobility generation; auto-save failed.",
+                "pre_actions": pre_actions,
+                "readiness": readiness or {"raw": readiness_raw},
+            }
+
+    if operation in stage_saved_required and not stage_saved:
+        return {
+            "success": False,
+            "operation": operation,
+            "error": "Stage must be saved before mobility generation.",
+            "pre_actions": pre_actions,
+            "readiness": readiness or {"raw": readiness_raw},
+        }
+
+    if operation in mobility_sync_required and not mobility_in_sync and auto_fix:
+        if not stage_saved:
+            out = save_stage()
+            ok = not _operation_failed(out)
+            _record_pre_action("save_stage", ok, out)
+            readiness, readiness_raw = _run_readiness_snapshot()
+            checks = readiness.get("checks", {}) if isinstance(readiness, dict) else {}
+            stage_saved = bool(checks.get("stage_saved", False))
+            if (not ok) or (not stage_saved):
+                return {
+                    "success": False,
+                    "operation": operation,
+                    "error": "Cannot auto-generate mobility because stage is not saved.",
+                    "pre_actions": pre_actions,
+                    "readiness": readiness or {"raw": readiness_raw},
+                }
+
+        out_mob = generate_mobility()
+        ok_mob = not _operation_failed(out_mob)
+        _record_pre_action("generate_mobility", ok_mob, out_mob)
+        if not ok_mob:
+            return {
+                "success": False,
+                "operation": operation,
+                "error": "Auto mobility generation failed.",
+                "pre_actions": pre_actions,
+                "readiness": readiness or {"raw": readiness_raw},
+            }
+
+        out_wait = wait_for_mobility_sync(timeout_seconds=180, poll_interval_seconds=1.0)
+        parsed_wait = _try_parse_json(out_wait)
+        synced = bool(isinstance(parsed_wait, dict) and parsed_wait.get("synced", False))
+        _record_pre_action("wait_for_mobility_sync", synced, out_wait)
+        readiness, readiness_raw = _run_readiness_snapshot()
+        checks = readiness.get("checks", {}) if isinstance(readiness, dict) else {}
+        mobility_in_sync = bool(checks.get("mobility_in_sync_with_db", False))
+        if not mobility_in_sync:
+            return {
+                "success": False,
+                "operation": operation,
+                "error": "Mobility is still not in sync after auto-fix attempts.",
+                "pre_actions": pre_actions,
+                "readiness": readiness or {"raw": readiness_raw},
+            }
+
+    if operation in mobility_sync_required and not mobility_in_sync:
+        return {
+            "success": False,
+            "operation": operation,
+            "error": "Mobility is not in sync. Run generate_mobility + wait_for_mobility_sync first.",
+            "pre_actions": pre_actions,
+            "readiness": readiness or {"raw": readiness_raw},
+        }
+
+    fn = registry[operation]
+    try:
+        output = fn(**args)
+    except TypeError as e:
+        return {
+            "success": False,
+            "operation": operation,
+            "error": f"Invalid arguments for '{operation}': {e}",
+            "pre_actions": pre_actions,
+            "args": args,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "operation": operation,
+            "error": f"Unexpected failure during '{operation}': {e}",
+            "pre_actions": pre_actions,
+            "args": args,
+        }
+
+    success = not _operation_failed(output)
+    parsed_output = _try_parse_json(output)
+    if operation == "wait_for_mobility_sync" and isinstance(parsed_output, dict):
+        success = bool(parsed_output.get("synced", False))
+    if operation == "wait_for_sim_completion" and isinstance(parsed_output, dict):
+        success = bool(parsed_output.get("completed", False))
+    final_readiness, final_raw = _run_readiness_snapshot()
+    return {
+        "success": success,
+        "operation": operation,
+        "args": args,
+        "pre_actions": pre_actions,
+        "output": output,
+        "readiness_after": final_readiness or {"raw": final_raw},
+    }
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def get_workflow_contracts() -> str:
+    """
+    Returns machine-readable workflow contracts (preconditions and auto-fix behavior)
+    for guarded operations. Agents should consult this to plan safe task order.
+    """
+    payload = {
+        "use_for_natural_language_control": True,
+        "preferred_executor": "execute_guarded_operation",
+        "supported_operations": sorted(_get_guarded_operation_registry().keys()),
+        "precondition_summary": {
+            "worker_required": ["generate_mobility", "start_simulation"],
+            "stage_saved_required": ["generate_mobility"],
+            "panel_required": ["start_simulation"],
+            "ues_required": ["start_simulation"],
+            "mobility_sync_required": ["start_simulation"],
+        },
+        "auto_fix_summary": {
+            "creates_new_stage_when_safe": ["create_panel", "create_ue", "create_ru", "create_du", "create_tx_rx_pair"],
+            "auto_create_panel_for_start_simulation": True,
+            "auto_generate_and_wait_mobility_for_start_simulation": True,
+            "auto_save_stage_when_needed_for_mobility": True,
+            "cannot_auto_attach_worker": True,
+            "cannot_auto_invent_ues_for_start_simulation": True,
+        },
+    }
+    return json.dumps(payload, indent=2)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+def execute_guarded_operation(operation: str, args_json: str = "{}", auto_fix: bool = True) -> str:
+    """
+    Executes a single operation with workflow safety checks and optional auto-fix.
+    This is the recommended entrypoint for reliable AODT control from natural language.
+
+    Args:
+        operation: Operation name (see get_workflow_contracts()).
+        args_json: JSON object string containing operation arguments.
+        auto_fix:  If true, safe preconditions are auto-resolved before execution.
+    """
+    parsed_args = _try_parse_json(args_json)
+    if parsed_args is None:
+        parsed_args = {}
+    if not isinstance(parsed_args, dict):
+        return json.dumps(
+            {
+                "success": False,
+                "operation": operation,
+                "error": "args_json must be a JSON object string.",
+            },
+            indent=2,
+        )
+
+    result = _execute_guarded_operation_internal(operation=operation, args=parsed_args, auto_fix=auto_fix)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+def execute_guarded_sequence(steps_json: str, auto_fix: bool = True, stop_on_error: bool = True) -> str:
+    """
+    Executes multiple operations in order, validating preconditions before each step.
+
+    steps_json format:
+      [
+        {"operation": "create_tx_rx_pair", "args": {"tx_position": [0,0,0], "rx_position": [5,0,0], "position_units": "meters"}},
+        {"operation": "start_simulation", "args": {}}
+      ]
+    """
+    parsed = _try_parse_json(steps_json)
+    if not isinstance(parsed, list):
+        return json.dumps(
+            {"success": False, "error": "steps_json must be a JSON array of step objects."},
+            indent=2,
+        )
+
+    results = []
+    overall_success = True
+    for idx, step in enumerate(parsed, start=1):
+        if not isinstance(step, dict):
+            step_result = {
+                "step_index": idx,
+                "success": False,
+                "error": "Each step must be an object with 'operation' and optional 'args'.",
+            }
+            results.append(step_result)
+            overall_success = False
+            if stop_on_error:
+                break
+            continue
+
+        operation = str(step.get("operation", "")).strip()
+        args = step.get("args", {})
+        if args is None:
+            args = {}
+        if not isinstance(args, dict):
+            step_result = {
+                "step_index": idx,
+                "operation": operation,
+                "success": False,
+                "error": "'args' must be an object.",
+            }
+            results.append(step_result)
+            overall_success = False
+            if stop_on_error:
+                break
+            continue
+
+        step_result = _execute_guarded_operation_internal(operation=operation, args=args, auto_fix=auto_fix)
+        step_result["step_index"] = idx
+        results.append(step_result)
+        if not step_result.get("success", False):
+            overall_success = False
+            if stop_on_error:
+                break
+
+    payload = {
+        "success": overall_success,
+        "auto_fix": auto_fix,
+        "stop_on_error": stop_on_error,
+        "steps_executed": len(results),
+        "results": results,
+    }
+    return json.dumps(payload, indent=2)
+
+
+# ─── 14. Raw execution ────────────────────────────────────────────────────────
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
 def execute_aodt_command(code: str) -> str:
@@ -1131,11 +2717,7 @@ def execute_aodt_command(code: str) -> str:
     Args:
         code: Python code string to execute inside AODT.
     """
-    response = _send("execute", {"code": code})
-    if response.get("status") == "success":
-        result = response.get("result", "")
-        return result if result else "Execution successful (no output)."
-    return f"Execution failed:\n{response.get('message', 'Unknown error')}"
+    return _run(code, truncate=100_000)
 
 
 if __name__ == "__main__":

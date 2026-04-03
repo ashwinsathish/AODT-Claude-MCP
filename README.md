@@ -37,7 +37,16 @@ Two components ship in this repo:
 | MCP Bridge | `mcp_server.py` | FastMCP server; translates tool calls into TCP commands |
 | Kit Extension | `exts/aodt.mcp_server/` | Runs inside AODT; executes code on the main thread and returns stdout |
 
-## Tools (35 total)
+## Tools (51 total)
+
+This server now includes a guarded workflow layer so agents can execute tasks in AODT-safe order without guessing preconditions.
+
+### Guarded Workflow (Recommended for NL Agents)
+| Tool | Description |
+|---|---|
+| `get_workflow_contracts` | Returns operation contracts, preconditions, and auto-fix behavior |
+| `execute_guarded_operation(operation, args_json, auto_fix)` | Executes one operation with workflow checks and safe auto-fixes |
+| `execute_guarded_sequence(steps_json, auto_fix, stop_on_error)` | Executes multi-step plans with validation at each step |
 
 ### Connectivity
 | Tool | Description |
@@ -88,19 +97,29 @@ Two components ship in this repo:
 ### Simulation Control
 | Tool | Description |
 |---|---|
-| `get_simulation_status` | Current state (playing / paused / stopped) and timeline position |
-| `start_simulation` | Play the simulation |
-| `stop_simulation` | Pause the simulation |
-| `reset_simulation` | Stop and reset to t=0 |
+| `get_simulation_status` | Worker simulation + timeline state |
+| `validate_control_readiness` | Preflight checklist for worker/live/panels/UE/mobility readiness |
+| `start_simulation` | Starts worker-driven simulation with AODT validation checks |
+| `stop_simulation` | Sends pause request to worker |
+| `reset_simulation` | Sends stop request + timeline reset |
+| `wait_for_sim_completion` | Waits for simulation completion or timeout |
 
 ### AODT Network Entities
 | Tool | Description |
 |---|---|
 | `get_scenario_info` | All parameters on the `/Scenario` prim |
 | `list_network_entities` | All RUs, DUs, and UEs with their positions |
-| `create_ue(position)` | Deploy a User Equipment (mobile device) |
-| `create_ru(position)` | Deploy a Radio Unit (base station antenna) |
-| `create_du(position)` | Deploy a Distributed Unit (baseband processor) |
+| `create_panel` | Creates a panel under `/Panels` |
+| `list_panels` | Lists panel prims and RF attributes |
+| `set_default_panels` | Sets `/Scenario` default panel types |
+| `create_ue(position, position_units)` | Deploy a User Equipment with scale-aware units |
+| `create_ru(position, position_units)` | Deploy a Radio Unit with scale-aware units |
+| `create_du(position, position_units)` | Deploy a Distributed Unit with scale-aware units |
+| `create_tx_rx_pair(tx_position, rx_position, ...)` | One-call RU+UE creation for TX/RX setup |
+| `generate_mobility` | Triggers mobility generation via worker pipeline |
+| `wait_for_mobility_sync` | Waits until mobility sync with DB |
+| `set_ray_pair_enabled` | Enables/disables ray visibility for RU-UE pair |
+| `refresh_raypaths` | Refreshes ray visualization from telemetry |
 | `get_ue_performance(prim_path)` | Live DL/UL throughput telemetry for a UE |
 
 ### AODT Configuration
@@ -121,6 +140,13 @@ Two components ship in this repo:
 | `search_aodt_assets(query)` | Search local paths and Nucleus for USD assets by keyword |
 | `list_loadable_scenes` | List all USD scenes in standard install and Nucleus paths |
 
+### Runtime Context and Logs
+| Tool | Description |
+|---|---|
+| `get_aodt_runtime_context` | Structured snapshot of stage/worker/session/simulation context |
+| `get_recent_aodt_logs` | Tail Kit + `aodt.control` logs |
+| `stream_aodt_logs` | Incremental log streaming with cursors (new lines only) |
+
 ### Raw Execution
 | Tool | Description |
 |---|---|
@@ -140,7 +166,11 @@ Two components ship in this repo:
 4. Click the **Gear icon** (Settings) and add the `exts/` folder of this repository to the **Extension Search Paths**.
 5. Search for **AODT MCP Server** and toggle it **Enabled**. The console should print:
    ```
-   [AODT-MCP] Started socket server on 0.0.0.0:8765
+   [AODT-MCP] Started socket server on 127.0.0.1:8765
+   ```
+   By default, the extension binds localhost for safety. You can override with:
+   ```bash
+   export AODT_MCP_HOST=0.0.0.0
    ```
 
 ### 2. Configure Claude Desktop
@@ -201,14 +231,27 @@ Take a screenshot and save it to /tmp/scene.png.
 Undo the last change.
 ```
 
+For natural-language agents, prefer guarded execution:
+
+```
+Use execute_guarded_operation to create a TX/RX pair:
+operation=create_tx_rx_pair
+args={"tx_position":[0,0,10],"rx_position":[60,0,1.5],"position_units":"meters","enable_rays":true}
+
+Then start simulation safely:
+operation=start_simulation
+auto_fix=true
+```
+
 ## Troubleshooting
 
 | Problem | Fix |
 |---|---|
-| **Connection refused** | Ensure the **AODT MCP Server** extension is enabled and the console shows `Started socket server on 0.0.0.0:8765` |
+| **Connection refused** | Ensure the **AODT MCP Server** extension is enabled and the console shows `Started socket server on 127.0.0.1:8765` (or your `AODT_MCP_HOST`) |
 | **Port conflict** | Change `PORT` in both `mcp_server.py` and `exts/aodt.mcp_server/aodt/mcp_server/__init__.py` |
 | **Execution timeout** | Long-running code hits the 10 s timeout. Break it into smaller calls or use `execute_aodt_command` with async-safe code |
 | **AODT entities not found** | Ensure an AODT scene is loaded (not a blank stage) before calling `create_ru`, `create_ue`, etc. |
+| **Agent runs wrong step order** | Use `execute_guarded_operation` / `execute_guarded_sequence` so preconditions are auto-checked and safe fixes are applied |
 
 ## Evaluations
 
