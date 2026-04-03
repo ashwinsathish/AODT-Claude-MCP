@@ -1,6 +1,7 @@
 import json
 import re
 import socket
+import time
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
@@ -61,7 +62,15 @@ def _run(code: str, truncate: int = 50_000) -> str:
         if len(result) > truncate:
             result = result[:truncate] + "\n... (output truncated)"
         return result
-    err = f"Error: {response.get('message', 'Unknown error')}"
+    err_msg = response.get("message", "Unknown error")
+    err = f"Error: {err_msg}"
+    # Avoid immediate recursive execute calls when the main-thread execution already timed out.
+    if "Execution timed out on the main thread" in err_msg:
+        return (
+            f"{err}\n"
+            "Hint: this usually means tool code blocked AODT's main thread. "
+            "Retry with lightweight operations first and inspect get_recent_aodt_logs()."
+        )
     diag = _collect_aodt_diagnostics(log_lines=80, truncate=30_000)
     if diag:
         if len(diag) > 30_000:
@@ -998,47 +1007,57 @@ def wait_for_mobility_sync(timeout_seconds: int = 180, poll_interval_seconds: fl
     Waits until UE mobility is in sync with DB (TelemetryExt check), or times out.
     Useful immediately after generate_mobility().
     """
-    code = f"""
+    timeout_s = max(1, int(timeout_seconds))
+    poll_s = max(0.1, float(poll_interval_seconds))
+    probe_code = """
 import json
-import time
 from aodt.telemetry import TelemetryExt
-
-_timeout = max(1, int({timeout_seconds}))
-_poll = max(0.1, float({poll_interval_seconds}))
-start = time.time()
-samples = []
-
-while True:
-    now = time.time()
-    elapsed = now - start
-    try:
-        synced = bool(TelemetryExt.is_ue_mobility_in_sync_with_db())
-    except Exception as e:
-        synced = False
-        samples.append({{"t": round(elapsed, 2), "synced": False, "error": str(e)}})
-    else:
-        samples.append({{"t": round(elapsed, 2), "synced": synced}})
-
-    if synced:
-        print(json.dumps({{
-            "synced": True,
-            "elapsed_seconds": round(elapsed, 2),
-            "samples": samples[-40:],
-        }}, indent=2))
-        break
-
-    if elapsed >= _timeout:
-        print(json.dumps({{
-            "synced": False,
-            "reason": "timeout",
-            "elapsed_seconds": round(elapsed, 2),
-            "samples": samples[-40:],
-        }}, indent=2))
-        break
-
-    time.sleep(_poll)
+payload = {"synced": False}
+try:
+    payload["synced"] = bool(TelemetryExt.is_ue_mobility_in_sync_with_db())
+except Exception as e:
+    payload["error"] = str(e)
+print(json.dumps(payload))
 """
-    return _run(code)
+    start = time.time()
+    samples = []
+    while True:
+        elapsed = time.time() - start
+        response = _send("execute", {"code": probe_code})
+        synced = False
+        error_text = None
+        if response.get("status") == "success":
+            raw = (response.get("result") or "").strip()
+            try:
+                data = json.loads(raw)
+            except Exception:
+                data = {"synced": False, "error": f"non-json probe output: {raw[:200]}"}
+            synced = bool(data.get("synced", False))
+            error_text = data.get("error")
+        else:
+            error_text = response.get("message", "probe execute failed")
+
+        sample = {"t": round(elapsed, 2), "synced": synced}
+        if error_text:
+            sample["error"] = str(error_text)
+        samples.append(sample)
+
+        if synced:
+            return json.dumps(
+                {"synced": True, "elapsed_seconds": round(elapsed, 2), "samples": samples[-40:]},
+                indent=2,
+            )
+        if elapsed >= timeout_s:
+            return json.dumps(
+                {
+                    "synced": False,
+                    "reason": "timeout",
+                    "elapsed_seconds": round(elapsed, 2),
+                    "samples": samples[-40:],
+                },
+                indent=2,
+            )
+        time.sleep(poll_s)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
@@ -1050,83 +1069,129 @@ def wait_for_sim_completion(
     """
     Waits for worker simulation to finish (or timeout) using ProgressModel state.
     """
-    code = f"""
+    timeout_s = max(1, int(timeout_seconds))
+    poll_s = max(0.1, float(poll_interval_seconds))
+    fail_if_not_running = bool(fail_if_not_running_initially)
+    probe_code = """
 import json
-import time
 from aodt.progress_bar.progress_bar import ProgressModel
-
-_timeout = max(1, int({timeout_seconds}))
-_poll = max(0.1, float({poll_interval_seconds}))
-_fail_if_not_running = {str(fail_if_not_running_initially)}
-
 pm = ProgressModel.get_model_instance()
-initial_running = pm.is_sim_running()
-initial_paused = pm.is_sim_paused()
-
-if _fail_if_not_running and not initial_running:
-    print(json.dumps({{
-        "completed": False,
-        "reason": "simulation_not_running_at_start",
-        "sim_running": initial_running,
-        "sim_paused": initial_paused,
-        "progress": pm.get_value_as_string(),
-        "progress_float": round(float(pm.get_value_as_float()), 4),
-    }}, indent=2))
-    raise SystemExit
-
-start = time.time()
-saw_running = initial_running
-history = []
-
-while True:
-    now = time.time()
-    elapsed = now - start
-    running = pm.is_sim_running()
-    paused = pm.is_sim_paused()
-    progress_float = float(pm.get_value_as_float())
-    progress_str = pm.get_value_as_string()
-    state = "running" if running and not paused else ("paused" if paused else "idle")
-
-    if running:
-        saw_running = True
-
-    if (not history) or state != history[-1]["state"] or abs(progress_float - history[-1]["progress_float"]) >= 0.01:
-        history.append({
-            "t": round(elapsed, 2),
-            "state": state,
-            "progress": progress_str,
-            "progress_float": round(progress_float, 4),
-        })
-
-    completed = (saw_running and not running and not paused) or progress_float >= 1.0
-    if completed:
-        print(json.dumps({
-            "completed": True,
-            "elapsed_seconds": round(elapsed, 2),
-            "final_state": state,
-            "progress": progress_str,
-            "progress_float": round(progress_float, 4),
-            "history": history[-40:],
-        }, indent=2))
-        break
-
-    if elapsed >= _timeout:
-        print(json.dumps({
-            "completed": False,
-            "reason": "timeout",
-            "elapsed_seconds": round(elapsed, 2),
-            "state": state,
-            "sim_running": running,
-            "sim_paused": paused,
-            "progress": progress_str,
-            "progress_float": round(progress_float, 4),
-            "history": history[-40:],
-        }, indent=2))
-        break
-
-    time.sleep(_poll)
+running = bool(pm.is_sim_running())
+paused = bool(pm.is_sim_paused())
+progress_float = float(pm.get_value_as_float())
+progress_str = pm.get_value_as_string()
+state = "running" if running and not paused else ("paused" if paused else "idle")
+print(json.dumps({
+    "sim_running": running,
+    "sim_paused": paused,
+    "progress": progress_str,
+    "progress_float": round(progress_float, 4),
+    "state": state,
+}))
 """
-    return _run(code)
+
+    def _probe():
+        resp = _send("execute", {"code": probe_code})
+        if resp.get("status") != "success":
+            return None, resp.get("message", "probe execute failed")
+        raw = (resp.get("result") or "").strip()
+        try:
+            return json.loads(raw), None
+        except Exception:
+            return None, f"non-json probe output: {raw[:200]}"
+
+    first, first_err = _probe()
+    if first is None:
+        return json.dumps({"completed": False, "reason": "probe_error", "error": first_err}, indent=2)
+
+    if fail_if_not_running and not bool(first.get("sim_running", False)):
+        return json.dumps(
+            {
+                "completed": False,
+                "reason": "simulation_not_running_at_start",
+                "sim_running": bool(first.get("sim_running", False)),
+                "sim_paused": bool(first.get("sim_paused", False)),
+                "progress": first.get("progress"),
+                "progress_float": first.get("progress_float"),
+            },
+            indent=2,
+        )
+
+    start = time.time()
+    saw_running = bool(first.get("sim_running", False))
+    history = [
+        {
+            "t": 0.0,
+            "state": first.get("state"),
+            "progress": first.get("progress"),
+            "progress_float": first.get("progress_float"),
+        }
+    ]
+
+    while True:
+        elapsed = time.time() - start
+        snap, err = _probe()
+        if snap is None:
+            history.append({"t": round(elapsed, 2), "state": "probe_error", "error": str(err)})
+            if elapsed >= timeout_s:
+                return json.dumps(
+                    {
+                        "completed": False,
+                        "reason": "timeout",
+                        "elapsed_seconds": round(elapsed, 2),
+                        "history": history[-40:],
+                    },
+                    indent=2,
+                )
+            time.sleep(poll_s)
+            continue
+
+        running = bool(snap.get("sim_running", False))
+        paused = bool(snap.get("sim_paused", False))
+        progress_float = float(snap.get("progress_float", 0.0))
+        state = snap.get("state", "unknown")
+        if running:
+            saw_running = True
+
+        if (not history) or state != history[-1].get("state") or abs(progress_float - float(history[-1].get("progress_float", 0.0))) >= 0.01:
+            history.append(
+                {
+                    "t": round(elapsed, 2),
+                    "state": state,
+                    "progress": snap.get("progress"),
+                    "progress_float": round(progress_float, 4),
+                }
+            )
+
+        completed = (saw_running and not running and not paused) or progress_float >= 1.0
+        if completed:
+            return json.dumps(
+                {
+                    "completed": True,
+                    "elapsed_seconds": round(elapsed, 2),
+                    "final_state": state,
+                    "progress": snap.get("progress"),
+                    "progress_float": round(progress_float, 4),
+                    "history": history[-40:],
+                },
+                indent=2,
+            )
+        if elapsed >= timeout_s:
+            return json.dumps(
+                {
+                    "completed": False,
+                    "reason": "timeout",
+                    "elapsed_seconds": round(elapsed, 2),
+                    "state": state,
+                    "sim_running": running,
+                    "sim_paused": paused,
+                    "progress": snap.get("progress"),
+                    "progress_float": round(progress_float, 4),
+                    "history": history[-40:],
+                },
+                indent=2,
+            )
+        time.sleep(poll_s)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))

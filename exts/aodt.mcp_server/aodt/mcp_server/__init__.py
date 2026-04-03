@@ -136,7 +136,7 @@ class AODTSocketServer:
                 # Execute the code in the global scope
                 exec(code, globals())
                 result_container["status"] = "success"
-            except Exception as e:
+            except BaseException:
                 result_container["status"] = "error"
                 result_container["error"] = traceback.format_exc()
             finally:
