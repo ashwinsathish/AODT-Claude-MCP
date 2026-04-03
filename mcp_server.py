@@ -16,14 +16,16 @@ ctx = omni.usd.get_context()
 stage = ctx.get_stage()
 if stage:
     try:
-        layer = stage.GetEditTarget().GetLayer()
-        if layer and (not layer.PermissionToEdit()):
-            session_layer = stage.GetSessionLayer()
-            if session_layer:
+        session_layer = stage.GetSessionLayer()
+        if session_layer:
+            current_layer = stage.GetEditTarget().GetLayer()
+            current_id = current_layer.identifier if current_layer else ""
+            session_id = session_layer.identifier
+            if current_id != session_id:
                 stage.SetEditTarget(session_layer)
-                print(f"Info: switched edit target to session layer: {session_layer.identifier}")
+                print(f"Info: using session edit target: {session_id}")
     except Exception as _edit_err:
-        print(f"Warning: automatic edit-target switch failed: {_edit_err}")
+        print(f"Warning: edit-target auto switch unavailable: {_edit_err}")
 """
 
 
@@ -107,8 +109,6 @@ def _looks_like_aodt_error_output(output: str) -> bool:
         if not s:
             continue
         if s.startswith("error:") or s.startswith("exception:"):
-            return True
-        if re.search(r"\bfailed\b", s) and "0 failed" not in s:
             return True
     return False
 
