@@ -849,7 +849,7 @@ def validate_control_readiness(require_live_session: bool = True, require_saved_
     Returns a preflight checklist for agentic AODT control.
     Includes readiness booleans for mobility generation and simulation start.
     """
-    code = f"""
+    code = """
 import json
 import carb.settings
 import omni.usd
@@ -860,8 +860,8 @@ from aodt.progress_bar.progress_bar import ProgressModel
 from aodt.telemetry import TelemetryExt
 from aodt.toolbar.extension import validate_ref_freq, validate_ru_du_assignment
 
-_require_live = {str(require_live_session)}
-_require_saved = {str(require_saved_stage)}
+_require_live = __REQUIRE_LIVE__
+_require_saved = __REQUIRE_SAVED__
 
 stage = omni.usd.get_context().get_stage()
 settings = carb.settings.get_settings()
@@ -986,6 +986,9 @@ payload = {
 
 print(json.dumps(payload, indent=2))
 """
+    code = code.replace("__REQUIRE_LIVE__", str(require_live_session)).replace(
+        "__REQUIRE_SAVED__", str(require_saved_stage)
+    )
     return _run(code)
 
 
