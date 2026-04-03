@@ -907,7 +907,7 @@ except Exception:
 try:
     validation_errors = sorted(list(validate_ref_freq().union(validate_ru_du_assignment())))
 except Exception as e:
-    validation_errors = [f"validation call failed: {e}"]
+    validation_errors = [f"validation call failed: {{e}}"]
 
 start_requirements = {
     "stage_loaded": stage_loaded,
